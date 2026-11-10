@@ -1,0 +1,34 @@
+{
+  "name": "voxora/voxora",
+  "description": "Self-hosted PHP platform for secure AI text-to-speech, voice management and workflow automation",
+  "type": "project",
+  "license": "MIT",
+  "keywords": ["tts", "ai", "elevenlabs", "openai", "self-hosted", "voice"],
+  "require": {
+    "php": ">=8.2",
+    "guzzlehttp/guzzle": "^7.8",
+    "psr/log": "^3.0",
+    "ext-sqlite3": "*",
+    "ext-sodium": "*",
+    "ext-json": "*"
+  },
+  "require-dev": {
+    "phpunit/phpunit": "^10.5"
+  },
+  "autoload": {
+    "psr-4": {
+      "Voxora\\": "src/"
+    }
+  },
+  "autoload-dev": {
+    "psr-4": {
+      "Voxora\\Tests\\": "tests/"
+    }
+  },
+  "scripts": {
+    "serve": "php -S 0.0.0.0:8080 -t public",
+    "test": "vendor/bin/phpunit",
+    "build": "@test"
+  },
+  "minimum-stability": "stable"
+}
