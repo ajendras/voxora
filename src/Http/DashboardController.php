@@ -14,6 +14,7 @@ use RuntimeException;
  * HTMX-aware controller responsible for the responsive UI.
  * Renders Tailwind-powered dashboard and library pages (full HTML) and
  * returns HTML fragments for instant synthesis results.
+ * Now includes session-based authentication and role-based UI.
  */
 final class DashboardController
 {
@@ -39,10 +40,21 @@ final class DashboardController
      */
     public function index(Request $request): Response
     {
-        $stats = $this->repository->getUsageStats();
+        if (!isset($_SESSION['user_id'])) {
+            return $this->loginAction($request);
+        }
+
+        $userId = (int) $_SESSION['user_id'];
+        $stats = $this->repository->getUsageStats($userId);
         $content = $this->renderSynthPanel();
 
-        $html = $this->renderLayout($content, 'Dashboard', 'dashboard', $stats);
+        $currentUser = [
+            'id' => $userId,
+            'username' => $_SESSION['username'] ?? 'user',
+            'role' => $_SESSION['role'] ?? 'user',
+        ];
+
+        $html = $this->renderLayout($content, 'Dashboard', 'dashboard', $stats, $currentUser);
 
         return Response::html($html);
     }
@@ -52,12 +64,53 @@ final class DashboardController
      */
     public function library(Request $request): Response
     {
+        if (!isset($_SESSION['user_id'])) {
+            return $this->loginAction($request);
+        }
+
         $library = $this->repository->listLibrary();
         $content = $this->renderLibraryPanel($library);
 
-        $html = $this->renderLayout($content, 'Voice Library', 'library');
+        $currentUser = [
+            'id' => (int) $_SESSION['user_id'],
+            'username' => $_SESSION['username'] ?? 'user',
+            'role' => $_SESSION['role'] ?? 'user',
+        ];
+
+        $html = $this->renderLayout($content, 'Voice Library', 'library', [], $currentUser);
 
         return Response::html($html);
+    }
+
+    public function loginAction(Request $request): Response
+    {
+        if ($request->getMethod() === 'POST') {
+            $username = trim($request->getPost('username', ''));
+            $password = $request->getPost('password', '');
+
+            if ($username === '' || $password === '') {
+                return Response::html($this->renderLoginForm(true));
+            }
+
+            $userData = $this->repository->authenticate($username, $password);
+            if ($userData !== null) {
+                $_SESSION['user_id'] = (int) $userData['id'];
+                $_SESSION['username'] = $userData['username'];
+                $_SESSION['role'] = $userData['role'];
+
+                return Response::html('<script>window.location.href = "/dashboard";</script>');
+            }
+
+            return Response::html($this->renderLoginForm(true));
+        }
+
+        return Response::html($this->renderLoginForm());
+    }
+
+    public function logoutAction(Request $request): Response
+    {
+        session_destroy();
+        return Response::html('<script>window.location.href = "/login";</script>');
     }
 
     /**
@@ -65,6 +118,13 @@ final class DashboardController
      */
     public function generateAction(Request $request): Response
     {
+        if (!isset($_SESSION['user_id'])) {
+            return Response::html(
+                '<div class="p-6 text-red-600 bg-red-50 dark:bg-red-950 dark:text-red-400 rounded-3xl">Please log in to generate speech.</div>',
+                401
+            );
+        }
+
         $text = trim($request->getPost('text', ''));
         $voiceId = trim($request->getPost('voice_id', '21m00Tcm4TlvDq8ikWAM'));
         $stability = (float) ($request->getPost('stability', 0.5));
@@ -111,28 +171,45 @@ final class DashboardController
         }
     }
 
-    private function renderLayout(string $mainContent, string $title = 'Voxora', string $active = 'dashboard', array $stats = []): string
+    private function renderLayout(string $mainContent, string $title = 'Voxora', string $active = 'dashboard', array $stats = [], array $currentUser = []): string
     {
         $stats = $stats ?: ['generations' => 42, 'cost' => '4.82', 'hours' => '2.1'];
+        $username = htmlspecialchars($currentUser['username'] ?? 'guest');
+        $role = $currentUser['role'] ?? 'user';
+        $isAdmin = $role === 'admin';
 
         $navItems = [
             ['key' => 'dashboard', 'label' => 'Dashboard', 'icon' => '◉', 'href' => '/dashboard'],
             ['key' => 'library', 'label' => 'Voice Library', 'icon' => '♬', 'href' => '/library'],
             ['key' => 'batch', 'label' => 'Batch Runner', 'icon' => '⟳', 'href' => '#'],
             ['key' => 'keys', 'label' => 'API Keys', 'icon' => '🔑', 'href' => '#'],
-            ['key' => 'analytics', 'label' => 'Analytics', 'icon' => '📈', 'href' => '#'],
         ];
+
+        if ($isAdmin) {
+            $navItems[] = ['key' => 'users', 'label' => 'Manage Users', 'icon' => '👤', 'href' => '#'];
+        }
 
         $navHtml = '';
         foreach ($navItems as $item) {
             $isActive = $item['key'] === $active ? 'bg-zinc-100 dark:bg-zinc-800 text-emerald-600' : 'hover:bg-zinc-100 dark:hover:bg-zinc-800';
             $navHtml .= <<<HTML
-            <a href="{$item['href']}" class="flex items-center gap-x-3 px-4 py-3 rounded-2xl text-sm font-medium transition-colors {$isActive}">
+            <a href="{$item['href']}" onclick="{$item['key']==='users' ? "alert('User management coming in v0.2');return false;" : ''}" class="flex items-center gap-x-3 px-4 py-3 rounded-2xl text-sm font-medium transition-colors {$isActive}">
                 <span class="text-xl">{$item['icon']}</span>
                 <span>{$item['label']}</span>
             </a>
 HTML;
         }
+
+        $userPill = <<<HTML
+            <div class="flex items-center gap-x-2 bg-zinc-800 rounded-3xl pl-2 pr-5 h-9">
+                <div class="w-6 h-6 bg-amber-300 rounded-2xl flex items-center justify-center text-amber-800 text-xs font-bold">{$username[0]}</div>
+                <div class="text-sm">{$username}</div>
+HTML;
+
+        if ($isAdmin) {
+            $userPill .= '<div class="ml-2 px-2 text-[10px] bg-violet-600 rounded-3xl text-white">ADMIN</div>';
+        }
+        $userPill .= '</div>';
 
         return <<<HTML
 <!DOCTYPE html>
@@ -197,8 +274,9 @@ HTML;
 
             <div class="px-6 py-6 border-t border-zinc-800 text-xs flex items-center justify-between text-zinc-500">
                 <div>© Voxora 2025</div>
-                <a href="#" onclick="toggleDarkMode()" class="hover:text-zinc-300 transition-colors">
-                    <i class="fa-solid fa-moon"></i>
+                <a href="/logout" class="hover:text-zinc-300 transition-colors flex items-center gap-x-1">
+                    <i class="fa-solid fa-right-from-bracket"></i>
+                    <span>Logout</span>
                 </a>
             </div>
         </div>
@@ -213,7 +291,7 @@ HTML;
                         <span class="text-sm font-medium">Back</span>
                     </div>
                     <div class="h-5 w-px bg-zinc-700"></div>
-                    <div class="text-sm font-medium text-white">Instant Synthesis</div>
+                    <div class="text-sm font-medium text-white">{$title}</div>
                 </div>
 
                 <div class="flex items-center gap-x-6">
@@ -229,10 +307,7 @@ HTML;
                         </div>
                     </div>
 
-                    <div class="flex items-center gap-x-2 bg-zinc-800 rounded-3xl pl-2 pr-5 h-9">
-                        <div class="w-6 h-6 bg-amber-300 rounded-2xl flex items-center justify-center text-amber-800 text-xs font-bold">JS</div>
-                        <div class="text-sm">jonas</div>
-                    </div>
+                    {$userPill}
                 </div>
             </div>
 
@@ -284,17 +359,93 @@ HTML;
         // Initialize
         window.onload = function() {
             initializeTailwind();
-            // Enable dark mode by default
             if (!document.documentElement.classList.contains('dark')) {
                 document.documentElement.classList.add('dark');
             }
         }
 
-        // Make functions available globally for inline onclick handlers
         window.downloadAudio = downloadAudio;
         window.copyText = copyText;
         window.updateSlider = updateSlider;
         window.toggleDarkMode = toggleDarkMode;
+    </script>
+</body>
+</html>
+HTML;
+    }
+
+    private function renderLoginForm(bool $hasError = false): string
+    {
+        $errorHtml = $hasError
+            ? '<div class="mb-6 p-4 bg-red-950 border border-red-500 text-red-400 rounded-3xl text-sm">Invalid username or password.</div>'
+            : '';
+
+        return <<<HTML
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Login — Voxora</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Space+Grotesk:wght@500;600&display=swap');
+        .tail-container { font-family: 'Inter', system_ui, sans-serif; }
+        .logo-font { font-family: 'Space Grotesk', sans-serif; }
+    </style>
+</head>
+<body class="tail-container bg-zinc-950 text-zinc-200 flex items-center justify-center min-h-screen">
+    <div class="w-full max-w-md">
+        <div class="flex justify-center mb-8">
+            <div class="flex items-center gap-x-3">
+                <div class="w-10 h-10 bg-emerald-500 text-white rounded-3xl flex items-center justify-center text-3xl">v</div>
+                <span class="logo-font text-5xl font-semibold tracking-tighter text-white">voxora</span>
+            </div>
+        </div>
+        
+        <div class="bg-zinc-900 rounded-3xl p-10 shadow-2xl">
+            <h1 class="text-3xl font-semibold text-center mb-2">Welcome back</h1>
+            <p class="text-zinc-400 text-center mb-8">Sign in to access the TTS control plane</p>
+            
+            {$errorHtml}
+            
+            <form method="POST" class="space-y-6">
+                <div>
+                    <label class="block text-xs font-mono tracking-widest text-zinc-400 mb-2">USERNAME</label>
+                    <input type="text" name="username" required autocomplete="username"
+                           class="w-full bg-zinc-800 border border-transparent focus:border-emerald-500 rounded-3xl px-6 h-14 text-white focus:outline-none">
+                </div>
+                
+                <div>
+                    <label class="block text-xs font-mono tracking-widest text-zinc-400 mb-2">PASSWORD</label>
+                    <input type="password" name="password" required autocomplete="current-password"
+                           class="w-full bg-zinc-800 border border-transparent focus:border-emerald-500 rounded-3xl px-6 h-14 text-white focus:outline-none">
+                </div>
+                
+                <button type="submit"
+                        class="w-full h-14 bg-white text-zinc-900 hover:bg-amber-200 active:scale-[0.985] transition-all rounded-3xl text-lg font-semibold">
+                    SIGN IN
+                </button>
+            </form>
+            
+            <div class="mt-8 text-center text-xs text-zinc-500">
+                Default accounts:<br>
+                <span class="font-mono">admin / demo123</span> (administrator)<br>
+                <span class="font-mono">user / demo123</span> (standard user)
+            </div>
+        </div>
+        
+        <div class="text-center mt-8 text-zinc-500 text-xs">
+            Self-hosted • Role-based • Secure by default
+        </div>
+    </div>
+
+    <script>
+        function initializeTailwind() {
+            tailwind.config = { content: [], theme: { extend: {} } };
+        }
+        window.onload = initializeTailwind;
     </script>
 </body>
 </html>

@@ -92,6 +92,7 @@ final class ApiController
                 'metadata' => $result->metadata,
                 'audio_size_bytes' => strlen($result->audioContent),
                 'generated_at' => (new DateTimeImmutable())->format('Y-m-d H:i:s'),
+                'user_id' => $token->userId ?? 1,
             ]);
 
             return Response::json([
@@ -102,6 +103,8 @@ final class ApiController
                 'metadata' => $result->metadata,
                 'filename' => $filename,
                 'text_preview' => substr($text, 0, 80) . (strlen($text) > 80 ? '...' : ''),
+                'user_id' => $token->userId,
+                'role' => $token->role,
             ]);
         } catch (InvalidArgumentException $e) {
             return Response::json(['error' => $e->getMessage()], 400);
@@ -123,11 +126,13 @@ final class ApiController
         }
 
         $limit = max(1, min(100, (int) ($request->getPost('limit', 20))));
-        $history = $this->repository->getHistory($limit);
+        $history = $this->repository->getHistory($limit, $token->userId);
 
         return Response::json([
             'history' => $history,
             'count' => count($history),
+            'user_id' => $token->userId,
+            'role' => $token->role,
         ]);
     }
 
@@ -150,14 +155,19 @@ final class ApiController
             ? $input['scopes']
             : ['tts:generate'];
 
+        $role = in_array($input['role'] ?? 'user', ['user', 'admin'], true)
+            ? ($input['role'] ?? 'user')
+            : 'user';
+
         try {
-            $tokenString = $this->keyManager->issueToken($name, $scopes);
+            $tokenString = $this->keyManager->issueToken($name, $scopes, $role);
 
             return Response::json([
                 'success' => true,
                 'token' => $tokenString,
                 'name' => $name,
                 'scopes' => $scopes,
+                'role' => $role,
                 'expires_at' => (new DateTimeImmutable('+90 days'))->format('c'),
                 'message' => 'Store this token securely. It cannot be retrieved later.',
             ]);
@@ -235,6 +245,7 @@ final class ApiController
             'provider' => $request->getPost('provider', ''),
             'name' => $request->getPost('name', ''),
             'scopes' => $request->getPost('scopes', ''),
+            'role' => $request->getPost('role', ''),
         ];
     }
 

@@ -73,8 +73,8 @@ Usage stats, history and cost tracking through <code>SqliteRepository::getUsageS
 <code>Token::hasScope()</code> enforces <code>tts:generate</code> on protected routes
 </td>
 <td valign="top">
-📈 <b>Self-hosted</b><br>
-SQLite + PHP 8.2; run locally with <code>composer run serve</code>
+👤 <b>Multi-User Auth</b><br>
+Session-based login, roles (admin/user), per-user history &amp; stats via SQLite
 </td>
 </tr>
 </table>
@@ -97,7 +97,7 @@ cp config/app.example.php config/app.php
 composer run serve
 ```
 
-The app will be available at http://localhost:8080/dashboard.
+The app will be available at http://localhost:8080/login (default admin/demo123).
 
 ## ⚡ Quick start
 
@@ -125,9 +125,18 @@ echo "Saved! Duration: " . ($result->duration ?? 'unknown') . "s\n";
 
 ## 🧰 Usage
 
+### Authentication
+
+Default credentials (change immediately in production by editing the database or extending user management):
+
+- **Administrator**: `admin` / `demo123` (full access, can issue tokens with elevated roles)
+- **Regular user**: `user` / `demo123` (standard tts:generate access, own history only)
+
+After login the top bar reflects the current user and role. Admins see additional navigation options. All dashboard actions require an active session. API tokens can now carry a `role` for RBAC.
+
 ### Dashboard synthesis (HTMX)
 
-Visit `/dashboard`, fill the form and click **GENERATE SPEECH**. The `DashboardController::generateAction()` returns a live audio fragment with player, download button and metadata.
+Visit `/dashboard` (after login), fill the form and click **GENERATE SPEECH**. The `DashboardController::generateAction()` returns a live audio fragment with player, download button and metadata. Stats and history are scoped to the logged-in user.
 
 ### Issue a scoped API token
 
@@ -135,12 +144,13 @@ Visit `/dashboard`, fill the form and click **GENERATE SPEECH**. The `DashboardC
 $keyManager = $kernel->getKeyManager();
 $token = $keyManager->issueToken(
     name: "Mobile App Integration",
-    scopes: ["tts:generate"]
+    scopes: ["tts:generate"],
+    role: "user"
 );
 echo "Token: $token\n";
 ```
 
-Use the token in the `Authorization: Bearer` header or `X-Api-Key` for `/api/v1/speech`.
+Use the token in the `Authorization: Bearer` header or `X-Api-Key` for `/api/v1/speech`. The `Token` object now exposes `role` and `userId` for role-based decisions.
 
 ### Batch processing from CSV
 
@@ -198,20 +208,21 @@ All values are defined in `config/app.php` and loaded by `Kernel`.
 flowchart TD
     Request[HTTP Request] --> Index[public/index.php]
     Index --> Kernel[Kernel::boot + handle]
-    Kernel --> Security[SecurityMiddleware]
+    Kernel --> Session[session_start + Auth]
     Kernel --> Router[Router]
-    Router --> Dashboard[DashboardController]
+    Router --> Dashboard[DashboardController<br>(login, index, generate)]
     Router --> Api[ApiController]
-    Api --> KeyManager[KeyManager::validate]
+    Api --> KeyManager[KeyManager::validate<br>(role + userId)]
     Api --> Manager[TTS\Manager::generate]
     Dashboard --> Manager
     Manager --> Provider[ElevenLabsProvider::synthesize]
-    Manager --> Repo[SqliteRepository<br>(cache, history, library)]
+    Manager --> Repo[SqliteRepository<br>(users, generations with user_id)]
     Batch[BatchGenerator::run] --> Manager
     Manager --> Synthesis[SynthesisResult<br>(save, toDataUri)]
+    Users[(users table<br>role-based)]
 ```
 
-`Kernel` wires together `KeyManager`, `TTS\Manager`, `SqliteRepository` and the two controllers. All synthesis paths converge on `Manager::generate()`, which selects a `ProviderInterface` implementation, caches results and records usage. The dashboard uses HTMX fragments while the API returns JSON with public audio URLs.
+`Kernel` wires together `KeyManager`, `TTS\Manager`, `SqliteRepository` and the two controllers. All synthesis paths converge on `Manager::generate()`, which selects a `ProviderInterface` implementation, caches results and records usage. The dashboard uses HTMX fragments while the API returns JSON with public audio URLs. Sessions + `users` table enable multi-user isolation and role checks (`admin` vs `user`).
 
 ## 📁 Project structure
 
@@ -222,25 +233,25 @@ flowchart TD
 ├── public/
 │   └── index.php                 # Front controller — registers Router & Kernel
 ├── src/
-│   ├── Kernel.php                # Bootstraps services, creates Manager + KeyManager
+│   ├── Kernel.php                # Bootstraps services, creates Manager + KeyManager, starts session
 │   ├── Security/
-│   │   └── KeyManager.php        # issueToken(), validate(), Sodium encryption
+│   │   └── KeyManager.php        # issueToken(), validate(), Token (now with role/userId), User concepts
 │   ├── TTS/
 │   │   ├── ProviderInterface.php # synthesize(text, voice, options)
 │   │   ├── ElevenLabsProvider.php
 │   │   └── Manager.php           # generate() with caching & repository
 │   ├── Http/
-│   │   ├── DashboardController.php # HTMX pages + generateAction
-│   │   └── ApiController.php     # speechAction, historyAction, issueTokenAction
+│   │   ├── DashboardController.php # HTMX pages + generateAction + login/logout
+│   │   └── ApiController.php     # speechAction, historyAction, issueTokenAction (role-aware)
 │   ├── Storage/
-│   │   └── SqliteRepository.php  # schema, saveGeneration, listLibrary, getUsageStats
+│   │   └── SqliteRepository.php  # schema (users + user_id), authenticate(), getUser(), scoped queries
 │   └── Automation/
 │       └── BatchGenerator.php    # run(csvPath, progress), Report value object
 ├── examples/
 │   └── batch.php                 # CLI demo using Manager + BatchGenerator
 ├── tests/
 │   └── Unit/
-│       └── KeyManagerTest.php    # token issuance, validation, expiry, scopes
+│       └── KeyManagerTest.php    # token issuance, validation, expiry, scopes, roles
 └── data/                         # SQLite DB and generated audio (gitignored)
 ```
 
@@ -252,13 +263,13 @@ composer test
 vendor/bin/phpunit
 ```
 
-The test suite covers `KeyManager` token issuance, validation, expiry checks, encryption round-trips and scope enforcement (`hasScope()`).
+The test suite covers `KeyManager` token issuance, validation, expiry checks, encryption round-trips, scope enforcement and the new role/userId fields.
 
 ## 📍 Roadmap
 
 <!-- roadmap:start -->
 - [x] **v0.1.0** — first release: Secure Vault, Unified Engine, Instant Synth, Batch Runner
-- [ ] Add user authentication and role-based multi-user support
+- [x] Add user authentication and role-based multi-user support
 - [ ] Local TTS fallback via Piper using Symfony Process component
 - [ ] Voice cloning workflow with sample upload to provider APIs
 - [ ] Rich SSML editor with live preview inside dashboard
