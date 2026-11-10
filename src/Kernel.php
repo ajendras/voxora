@@ -63,7 +63,7 @@ final class Kernel
 
         // TTS engine with available providers
         $providers = $this->createTtsProviders();
-        $this->ttsManager = new Manager(...$providers, $this->repository);
+        $this->ttsManager = new Manager($this->repository, ...$providers);
 
         // Middleware for API token validation
         $this->securityMiddleware = new SecurityMiddleware($this->keyManager);

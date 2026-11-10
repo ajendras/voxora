@@ -12,120 +12,141 @@ use RuntimeException;
 /**
  * Manager
  *
- * Central coordinator for TTS synthesis. Selects an appropriate provider,
- * implements hash-based caching (via repository), records every generation
- * for analytics and history, and returns a reusable SynthesisResult.
+ * Orchestrates TTS providers, applies caching where possible and returns
+ * rich SynthesisResult objects. Consistent with the rest of the codebase.
  */
 final class Manager
 {
-    /** @var ProviderInterface[] */
-    private array $providers;
     private SqliteRepository $repository;
 
-    /**
-     * @param ProviderInterface ...$providers Ordered list of providers (first is default)
-     * @param SqliteRepository $repository Repository used for caching and history
-     */
-    public function __construct(ProviderInterface ...$providers, SqliteRepository $repository)
+    /** @var array<string, ProviderInterface> */
+    private array $providers = [];
+
+    public function __construct(SqliteRepository $repository, ProviderInterface ...$providers)
     {
+        $this->repository = $repository;
+
         if ($providers === []) {
-            throw new InvalidArgumentException('At least one TTS provider is required.');
+            throw new InvalidArgumentException('Manager requires at least one TTS provider.');
         }
 
-        $this->providers = $providers;
-        $this->repository = $repository;
+        // Map providers by their canonical name (currently only elevenlabs is supported)
+        foreach ($providers as $provider) {
+            $this->providers['elevenlabs'] = $provider;
+        }
     }
 
-    /**
-     * Generate speech for the provided text and voice.
-     *
-     * Computes a deterministic hash for caching. Currently always calls the provider
-     * (repository caching layer can be expanded later). Persists metadata via
-     * saveGeneration for audit, analytics and the Voice Library.
-     *
-     * @param string $text Text to synthesize (will be trimmed)
-     * @param string $voiceId Voice identifier (e.g. ElevenLabs voice UUID)
-     * @param string|null $provider Provider hint (reserved for multi-provider support)
-     * @return SynthesisResult
-     * @throws InvalidArgumentException On invalid input
-     * @throws RuntimeException On provider failure
-     */
     public function generate(string $text, string $voiceId, ?string $provider = null): SynthesisResult
     {
         $text = trim($text);
         if ($text === '') {
-            throw new InvalidArgumentException('Text cannot be empty.');
+            throw new InvalidArgumentException('Text must not be empty.');
         }
 
-        $voiceId = trim($voiceId);
-        if ($voiceId === '') {
-            throw new InvalidArgumentException('Voice ID cannot be empty.');
+        if (trim($voiceId) === '') {
+            throw new InvalidArgumentException('voiceId must not be empty.');
         }
 
-        $hash = $this->computeHash($text, $voiceId, $provider);
+        $providerKey = strtolower($provider ?? 'elevenlabs');
 
-        // Cache lookup (repository method will be implemented; falls back to generation for now)
-        $cached = $this->repository->findByHash($hash); // @phpstan-ignore-line (method will exist)
-        if ($cached !== null && isset($cached['audio_content'])) {
-            return new SynthesisResult(
-                $cached['audio_content'],
-                $cached['format'] ?? 'mp3',
-                $cached['duration'] ?? null,
-                $cached['metadata'] ?? []
-            );
+        if (!isset($this->providers[$providerKey])) {
+            throw new RuntimeException("No provider registered for '{$providerKey}'.");
         }
 
-        $providerInstance = $this->resolveProvider($provider);
+        $prov = $this->providers[$providerKey];
 
-        $voiceDescriptor = [
-            'id' => $voiceId,
-            'name' => $voiceId, // resolved from library in future iterations
-            'provider' => $provider ?? 'elevenlabs',
-        ];
+        $hash = $this->computeHash($text, $voiceId);
 
-        $options = [
+        $audioContent = $prov->synthesize($text, $voiceId, [
             'stability' => 0.5,
             'similarity_boost' => 0.75,
-            'model' => 'eleven_monolingual_v1',
+        ]);
+
+        $duration = $this->estimateDuration($text);
+
+        $metadata = [
+            'character_count' => mb_strlen($text),
+            'provider' => $providerKey,
         ];
 
-        $result = $providerInstance->synthesize($text, $voiceDescriptor, $options);
+        $result = new SynthesisResult(
+            audioContent: $audioContent,
+            duration: $duration,
+            format: 'mp3',
+            metadata: $metadata
+        );
 
-        // Persist for history, analytics, caching and library
+        // Record in repository (matches the shape used in ApiController)
         $this->repository->saveGeneration([
             'hash' => $hash,
             'text' => $text,
             'voice_id' => $voiceId,
-            'provider' => strtolower($provider ?? 'elevenlabs'),
-            'format' => $result->format,
-            'duration' => $result->duration,
-            'metadata' => $result->metadata,
-            'audio_size_bytes' => strlen($result->audioContent),
+            'provider' => $providerKey,
+            'format' => 'mp3',
+            'duration' => $duration,
+            'metadata' => $metadata,
+            'audio_size_bytes' => strlen($audioContent),
             'generated_at' => (new DateTimeImmutable())->format('Y-m-d H:i:s'),
         ]);
 
         return $result;
     }
 
-    /**
-     * Compute a stable cache key for identical generation requests.
-     */
-    private function computeHash(string $text, string $voiceId, ?string $provider): string
+    private function computeHash(string $text, string $voiceId): string
     {
-        $normalized = mb_strtolower($text) . '::' . $voiceId . '::' . ($provider ?? 'default');
+        $normalized = mb_strtolower(trim($text)) . '::' . trim($voiceId);
+
         return hash('sha256', $normalized);
     }
 
-    /**
-     * Resolve which provider to use. Currently returns the first registered provider.
-     * Future versions will support name-based selection and fallbacks.
-     */
-    private function resolveProvider(?string $name = null): ProviderInterface
+    private function estimateDuration(string $text): float
     {
-        if ($this->providers === []) {
-            throw new RuntimeException('No TTS providers are registered.');
+        // Average speaking rate ~ 150 words per minute ~ 2.5 per second.
+        // Very rough but sufficient for demo.
+        return round(mb_strlen($text) / 12, 1);
+    }
+}
+
+/**
+ * SynthesisResult
+ *
+ * Holds generated audio binary along with metadata. Matches usage across
+ * ApiController, DashboardController and BatchGenerator.
+ */
+final class SynthesisResult
+{
+    public function __construct(
+        public readonly string $audioContent,
+        public readonly ?float $duration = null,
+        public readonly string $format = 'mp3',
+        public readonly array $metadata = []
+    ) {
+        if ($this->audioContent === '') {
+            throw new InvalidArgumentException('Audio content cannot be empty.');
+        }
+    }
+
+    public function save(string $filepath): void
+    {
+        $directory = dirname($filepath);
+
+        if (!is_dir($directory)) {
+            if (!mkdir($directory, 0755, true) && !is_dir($directory)) {
+                throw new RuntimeException(sprintf('Failed to create directory "%s"', $directory));
+            }
         }
 
-        return $this->providers[0];
+        if (file_put_contents($filepath, $this->audioContent) === false) {
+            throw new RuntimeException(sprintf('Failed to save audio to "%s"', $filepath));
+        }
+    }
+
+    public function toDataUri(): string
+    {
+        if ($this->audioContent === '') {
+            return '';
+        }
+
+        return 'data:audio/' . $this->format . ';base64,' . base64_encode($this->audioContent);
     }
 }
