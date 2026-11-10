@@ -450,14 +450,19 @@ HTML;
 
     private function renderLibraryPanel(array $libraryItems = []): string
     {
+        if (empty($libraryItems)) {
+            $libraryItems = $this->demoVoices;
+        }
+        $voiceCount = count($libraryItems);
+
         $itemsHtml = '';
-        foreach ($this->demoVoices as $voice) {
+        foreach ($libraryItems as $voice) {
             $itemsHtml .= <<<HTML
 <div class="bg-zinc-900 border border-zinc-700 rounded-3xl p-6 hover:border-emerald-500 transition group">
     <div class="flex justify-between">
         <div>
             <div class="font-semibold text-xl text-white">{$voice['name']}</div>
-            <div class="text-emerald-300 text-sm">{$voice['description']}</div>
+            <div class="text-emerald-300 text-sm">{$voice['description'] ?? ''}</div>
         </div>
         <button onclick="window.location='/dashboard?voice={$voice['id']}'" 
                 class="self-start text-xs border border-zinc-700 hover:border-white px-5 h-8 rounded-3xl text-white transition">
@@ -495,7 +500,7 @@ HTML;
     </div>
 
     <div class="mt-12 text-xs uppercase font-mono text-zinc-500 border-t border-zinc-800 pt-6">
-        {$this->repository->listLibrary() ? count($this->repository->listLibrary()) : 0} voices stored in SQLite • 
+        {$voiceCount} voices stored in SQLite • 
         Tags and presets will be stored here
     </div>
 </div>
