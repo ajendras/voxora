@@ -192,8 +192,13 @@ final class DashboardController
         $navHtml = '';
         foreach ($navItems as $item) {
             $isActive = $item['key'] === $active ? 'bg-zinc-100 dark:bg-zinc-800 text-emerald-600' : 'hover:bg-zinc-100 dark:hover:bg-zinc-800';
+            $onclick = '';
+            if ($item['key'] === 'users') {
+                $onclick = "alert('User management coming in v0.2');return false;";
+            }
+
             $navHtml .= <<<HTML
-            <a href="{$item['href']}" onclick="{$item['key']==='users' ? "alert('User management coming in v0.2');return false;" : ''}" class="flex items-center gap-x-3 px-4 py-3 rounded-2xl text-sm font-medium transition-colors {$isActive}">
+            <a href="{$item['href']}" onclick="{$onclick}" class="flex items-center gap-x-3 px-4 py-3 rounded-2xl text-sm font-medium transition-colors {$isActive}">
                 <span class="text-xl">{$item['icon']}</span>
                 <span>{$item['label']}</span>
             </a>
