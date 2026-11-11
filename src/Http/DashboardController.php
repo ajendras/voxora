@@ -667,6 +667,7 @@ HTML;
     {
         $duration = $info['duration'] ?? '3.4';
         $meta = $info['metadata'] ?? [];
+        $characterCount = $meta['character_count'] ?? '142';
 
         return <<<HTML
 <div class="rounded-3xl bg-gradient-to-br from-zinc-800 to-zinc-900 border border-emerald-900 p-7 shadow-2xl">
@@ -710,7 +711,7 @@ HTML;
         </div>
         <div class="bg-black/30 rounded-2xl py-3">
             <div class="text-zinc-400">TOKENS</div>
-            <div class="font-mono text-lg text-white">{$meta['character_count'] ?? '142'}</div>
+            <div class="font-mono text-lg text-white">{$characterCount}</div>
         </div>
         <div class="bg-black/30 rounded-2xl py-3">
             <div class="text-zinc-400">COST</div>
