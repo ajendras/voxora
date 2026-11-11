@@ -618,7 +618,7 @@ HTML;
     <div class="flex justify-between">
         <div>
             <div class="font-semibold text-xl text-white">{$voice['name']}</div>
-            <div class="text-emerald-300 text-sm">{$voice['description'] ?? ''}</div>
+            <div class="text-emerald-300 text-sm">{($voice['description'] ?? '')}</div>
         </div>
         <button onclick="window.location='/dashboard?voice={$voice['id']}'" 
                 class="self-start text-xs border border-zinc-700 hover:border-white px-5 h-8 rounded-3xl text-white transition">
