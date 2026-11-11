@@ -14,6 +14,7 @@ use Voxora\Security\KeyManager;
 use Voxora\Storage\SqliteRepository;
 use Voxora\TTS\ElevenLabsProvider;
 use Voxora\TTS\Manager;
+use Voxora\TTS\PiperProvider;
 use Voxora\TTS\ProviderInterface;
 use RuntimeException;
 
@@ -21,7 +22,7 @@ use RuntimeException;
  * Kernel
  *
  * Central application bootstrapper and request dispatcher.
- * Wires KeyManager, TTS Manager, Repository and SecurityMiddleware together.
+ * Wires KeyManager, TTS Manager (with Piper fallback), Repository and SecurityMiddleware together.
  * Handles both HTMX dashboard routes and JSON API routes.
  */
 final class Kernel
@@ -61,7 +62,7 @@ final class Kernel
             (int) ($this->config['security']['token_lifetime_days'] ?? 90)
         );
 
-        // TTS engine with available providers
+        // TTS engine with available providers (Piper added as local fallback)
         $providers = $this->createTtsProviders();
         $this->ttsManager = new Manager($this->repository, ...$providers);
 
@@ -79,7 +80,7 @@ final class Kernel
         $providers = [];
         $cfg = $this->config['providers'] ?? [];
 
-        // ElevenLabs (currently the primary implemented provider)
+        // ElevenLabs (primary cloud provider)
         if (!empty($cfg['eleven']['api_key']) && $cfg['eleven']['api_key'] !== 'sk-...') {
             $providers[] = new ElevenLabsProvider(
                 $cfg['eleven']['api_key'],
@@ -87,13 +88,20 @@ final class Kernel
             );
         }
 
-        // Future providers (OpenAI, Azure, local fallback) can be added here
+        // Piper local fallback (only if model is present)
+        $piperCfg = $cfg['piper'] ?? [];
+        if (!empty($piperCfg['model']) && file_exists($piperCfg['model'])) {
+            $providers[] = new PiperProvider(
+                $piperCfg['binary'] ?? 'piper',
+                $piperCfg['model']
+            );
+        }
 
         if ($providers === []) {
             // In production this would be a soft failure with UI warning.
             // For now we require at least one provider.
             throw new RuntimeException(
-                'No TTS providers are configured. Please set ELEVENLABS_API_KEY environment variable.'
+                'No TTS providers are configured. Please set providers.eleven.api_key or providers.piper.model.'
             );
         }
 

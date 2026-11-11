@@ -27,6 +27,7 @@ Developers integrating high-quality voices face fragmented provider APIs, expose
 - **Single unified interface** — `TTS\Manager::generate()` routes through `ProviderInterface` implementations (currently `ElevenLabsProvider`) with automatic SQLite caching.
 - **Zero-copy automation** — `BatchGenerator::run()` turns a CSV into dozens of MP3s in one call, with optional progress callbacks and a full `Report`.
 - **Instant UI + REST** — Responsive HTMX/Tailwind dashboard and a token-protected JSON API let you preview, download or embed speech from any app.
+- **Local fallback** — Seamless offline synthesis via Piper when cloud providers are unavailable.
 
 ## 🎬 Demo
 
@@ -73,8 +74,8 @@ Usage stats, history and cost tracking through <code>SqliteRepository::getUsageS
 <code>Token::hasScope()</code> enforces <code>tts:generate</code> on protected routes
 </td>
 <td valign="top">
-👤 <b>Multi-User Auth</b><br>
-Session-based login, roles (admin/user), per-user history &amp; stats via SQLite
+📢 <b>Local TTS</b><br>
+Piper fallback via Symfony Process — fully offline synthesis on cloud failure
 </td>
 </tr>
 </table>
@@ -85,6 +86,7 @@ Session-based login, roles (admin/user), per-user history &amp; stats via SQLite
 
 - PHP 8.2+ with `ext-sqlite3`, `ext-sodium`, `ext-json`
 - Composer
+- (Optional) Piper binary + voice model for local fallback
 
 ```bash
 composer create-project ajendras/voxora voxora-app
@@ -98,6 +100,31 @@ composer run serve
 ```
 
 The app will be available at http://localhost:8080/login (default admin/demo123).
+
+## 🗣️ Local TTS with Piper
+
+Voxora automatically falls back to fully offline TTS using the Piper engine (via Symfony Process) when the primary provider fails or is unavailable.
+
+**Setup steps:**
+
+1. Download the Piper binary for your OS from https://github.com/rhasspy/piper/releases
+2. Download a voice model (e.g. `en_US-lessac-medium.onnx`) from https://huggingface.co/rhasspy/piper-voices
+3. Configure in `config/app.php`:
+
+```php
+'providers' => [
+    'eleven' => [
+        'api_key' => 'your_elevenlabs_key',
+        'base_uri' => 'https://api.elevenlabs.io/v1',
+    ],
+    'piper' => [
+        'binary' => 'piper', // or absolute path e.g. '/usr/local/bin/piper'
+        'model' => __DIR__ . '/../models/en_US-lessac-medium.onnx',
+    ],
+],
+```
+
+The `TTS\Manager::generate()` call will transparently fallback. WAV output is returned for local generations. Explicit usage: `provider: 'piper'`.
 
 ## ⚡ Quick start
 
@@ -116,7 +143,7 @@ $manager = $kernel->getTtsManager();
 $result = $manager->generate(
     text: "Hello from Voxora — self-hosted AI speech.",
     voiceId: "21m00Tcm4TlvDq8ikWAM",
-    provider: "elevenlabs"
+    provider: "elevenlabs" // falls back to "piper" on error
 );
 
 $result->save('output/hello.mp3');
@@ -188,6 +215,8 @@ curl -X POST http://localhost:8080/api/v1/speech \
   -d 'text=Welcome to the control plane.&voice_id=21m00Tcm4TlvDq8ikWAM'
 ```
 
+Provider can be set to `piper` for local synthesis.
+
 ## 🔧 Configuration
 
 | Option                        | Default               | Description |
@@ -197,6 +226,8 @@ curl -X POST http://localhost:8080/api/v1/speech \
 | `storage.path`                | `data/voxora.db`      | SQLite database path passed to `SqliteRepository` |
 | `providers.eleven.api_key`    | (required)            | ElevenLabs API key used by `ElevenLabsProvider` |
 | `providers.eleven.base_uri`   | `https://api.elevenlabs.io/v1` | Base URL for the ElevenLabs API |
+| `providers.piper.binary`      | `piper`               | Path to Piper CLI binary (must be executable) |
+| `providers.piper.model`       | (required for fallback) | Path to Piper .onnx voice model file |
 | `audio.directory`             | `storage/audio`       | Directory where `ApiController::speechAction()` saves generated MP3s |
 | `audio.public_url_prefix`     | `/audio`              | Public URL prefix returned in JSON responses |
 
@@ -215,14 +246,17 @@ flowchart TD
     Api --> KeyManager[KeyManager::validate<br>(role + userId)]
     Api --> Manager[TTS\Manager::generate]
     Dashboard --> Manager
-    Manager --> Provider[ElevenLabsProvider::synthesize]
-    Manager --> Repo[SqliteRepository<br>(users, generations with user_id)]
+    Manager --> Provider[ProviderInterface]
+    Provider --> ElevenLabs[ElevenLabsProvider]
+    Provider --> Piper[PiperProvider]
+    Manager --> Fallback[Fallback to Piper on cloud error]
+    Manager --> Repo[SqliteRepository<br>(users, generations with user_id + audio cache)]
     Batch[BatchGenerator::run] --> Manager
     Manager --> Synthesis[SynthesisResult<br>(save, toDataUri)]
     Users[(users table<br>role-based)]
 ```
 
-`Kernel` wires together `KeyManager`, `TTS\Manager`, `SqliteRepository` and the two controllers. All synthesis paths converge on `Manager::generate()`, which selects a `ProviderInterface` implementation, caches results and records usage. The dashboard uses HTMX fragments while the API returns JSON with public audio URLs. Sessions + `users` table enable multi-user isolation and role checks (`admin` vs `user`).
+`Kernel` wires together `KeyManager`, `TTS\Manager`, `SqliteRepository` and the two controllers. All synthesis paths converge on `Manager::generate()`, which selects a `ProviderInterface` implementation, caches results and records usage. The dashboard uses HTMX fragments while the API returns JSON with public audio URLs. Sessions + `users` table enable multi-user isolation and role checks (`admin` vs `user`). Piper is used as automatic fallback for offline/resilient operation.
 
 ## 📁 Project structure
 
@@ -239,7 +273,9 @@ flowchart TD
 │   ├── TTS/
 │   │   ├── ProviderInterface.php # synthesize(text, voice, options)
 │   │   ├── ElevenLabsProvider.php
-│   │   └── Manager.php           # generate() with caching & repository
+│   │   ├── PiperProvider.php     # local synthesis via Symfony Process + WAV output
+│   │   ├── SynthesisResult.php   # common result value object (mp3/wav)
+│   │   └── Manager.php           # generate() with caching, usage recording & Piper fallback
 │   ├── Http/
 │   │   ├── DashboardController.php # HTMX pages + generateAction + login/logout
 │   │   └── ApiController.php     # speechAction, historyAction, issueTokenAction (role-aware)
@@ -263,14 +299,14 @@ composer test
 vendor/bin/phpunit
 ```
 
-The test suite covers `KeyManager` token issuance, validation, expiry checks, encryption round-trips, scope enforcement and the new role/userId fields.
+The test suite covers `KeyManager` token issuance, validation, expiry checks, encryption round-trips, scope enforcement and the new role/userId fields. New unit tests validate Piper WAV duration parsing and fallback paths.
 
 ## 📍 Roadmap
 
 <!-- roadmap:start -->
 - [x] **v0.1.0** — first release: Secure Vault, Unified Engine, Instant Synth, Batch Runner
 - [x] Add user authentication and role-based multi-user support
-- [ ] Local TTS fallback via Piper using Symfony Process component
+- [x] Local TTS fallback via Piper using Symfony Process component
 - [ ] Voice cloning workflow with sample upload to provider APIs
 - [ ] Rich SSML editor with live preview inside dashboard
 - [ ] FFmpeg integration for normalization, loudness and format conversion

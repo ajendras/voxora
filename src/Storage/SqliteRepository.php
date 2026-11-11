@@ -4,272 +4,183 @@ declare(strict_types=1);
 
 namespace Voxora\Storage;
 
-use DateTimeImmutable;
-use SQLite3;
+use PDO;
+use PDOException;
 use RuntimeException;
+use InvalidArgumentException;
+use DateTimeImmutable;
 
 /**
  * SqliteRepository
  *
- * SQLite-backed storage for generations, voice library and usage analytics.
- * Creates schema on first use and provides clean query methods with input
- * sanitization via prepared statements.
+ * Handles all persistence using a single SQLite file.
+ * Supports users with roles, generation history (with audio caching for fallback),
+ * voice library, usage stats and Piper voice metadata.
  */
 final class SqliteRepository
 {
-    private SQLite3 $db;
+    private PDO $pdo;
     private string $path;
 
     public function __construct(string $path)
     {
-        if ($path === '') {
-            throw new RuntimeException('Database path cannot be empty.');
-        }
         $this->path = $path;
-    }
-
-    /**
-     * Initialize the database and schema. Idempotent.
-     */
-    public function initialize(): void
-    {
-        $dir = dirname($this->path);
+        $dir = dirname($path);
         if (!is_dir($dir)) {
             if (!mkdir($dir, 0755, true) && !is_dir($dir)) {
-                throw new RuntimeException('Failed to create database directory: ' . $dir);
+                throw new RuntimeException('Could not create storage directory.');
             }
         }
 
-        $this->db = new SQLite3($this->path);
-        $this->db->enableExceptions(true);
-        $this->db->exec('PRAGMA journal_mode=WAL;');
-        $this->db->exec('PRAGMA foreign_keys=ON;');
-
-        $this->createTables();
+        $this->pdo = new PDO('sqlite:' . $path);
+        $this->pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+        $this->pdo->exec('PRAGMA foreign_keys = ON');
     }
 
-    private function createTables(): void
+    public function initialize(): void
     {
-        // Generations / history
-        $this->db->exec("
+        $this->pdo->exec("
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY,
+                username TEXT UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL,
+                role TEXT NOT NULL DEFAULT 'user',
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            );
+        ");
+
+        $this->pdo->exec("
             CREATE TABLE IF NOT EXISTS generations (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id INTEGER PRIMARY KEY,
                 hash TEXT UNIQUE NOT NULL,
+                user_id INTEGER NOT NULL,
                 text TEXT NOT NULL,
                 voice_id TEXT NOT NULL,
-                provider TEXT NOT NULL DEFAULT 'elevenlabs',
-                format TEXT NOT NULL DEFAULT 'mp3',
+                provider TEXT NOT NULL,
+                format TEXT NOT NULL,
                 duration REAL,
                 metadata TEXT,
-                audio_size_bytes INTEGER DEFAULT 0,
-                generated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-            )
+                audio_content BLOB,
+                audio_size_bytes INTEGER,
+                generated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users(id)
+            );
         ");
 
-        // Voice library
-        $this->db->exec("
-            CREATE TABLE IF NOT EXISTS voices (
-                id TEXT PRIMARY KEY,
-                name TEXT NOT NULL,
-                description TEXT,
-                provider TEXT NOT NULL DEFAULT 'elevenlabs',
-                tags TEXT,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-            )
-        ");
-
-        // Seed demo voices if table is empty
-        $count = (int) $this->db->querySingle('SELECT COUNT(*) FROM voices');
+        // Insert default users if none exist
+        $count = (int) $this->pdo->query('SELECT COUNT(*) FROM users')->fetchColumn();
         if ($count === 0) {
-            $this->seedDemoVoices();
+            $this->pdo->exec("
+                INSERT INTO users (username, password_hash, role) VALUES 
+                ('admin', '" . password_hash('demo123', PASSWORD_DEFAULT) . "', 'admin'),
+                ('user', '" . password_hash('demo123', PASSWORD_DEFAULT) . "', 'user');
+            ");
         }
-
-        // Index for fast lookups
-        $this->db->exec('CREATE INDEX IF NOT EXISTS idx_generations_hash ON generations(hash);');
-        $this->db->exec('CREATE INDEX IF NOT EXISTS idx_generations_date ON generations(generated_at DESC);');
     }
 
-    private function seedDemoVoices(): void
+    public function authenticate(string $username, string $password): ?array
     {
-        $voices = [
-            [
-                'id' => '21m00Tcm4TlvDq8ikWAM',
-                'name' => 'Rachel',
-                'description' => 'American • Warm & versatile',
-                'provider' => 'elevenlabs',
-                'tags' => json_encode(['warm', 'female', 'english']),
-            ],
-            [
-                'id' => 'AZnzlkDJ2myd1k8p7Q6X',
-                'name' => 'Domi',
-                'description' => 'American • Upbeat & clear',
-                'provider' => 'elevenlabs',
-                'tags' => json_encode(['upbeat', 'female', 'english']),
-            ],
-            [
-                'id' => 'pNInz6obpgDQGcFmaJgB',
-                'name' => 'Adam',
-                'description' => 'American • Deep & authoritative',
-                'provider' => 'elevenlabs',
-                'tags' => json_encode(['deep', 'male', 'english']),
-            ],
-            [
-                'id' => 'EXAVITQu4vr4xnSDxMaL',
-                'name' => 'Bella',
-                'description' => 'American • Friendly & expressive',
-                'provider' => 'elevenlabs',
-                'tags' => json_encode(['friendly', 'female', 'english']),
-            ],
-        ];
+        $stmt = $this->pdo->prepare('SELECT id, username, role, password_hash FROM users WHERE username = ?');
+        $stmt->execute([$username]);
+        $user = $stmt->fetch(PDO::FETCH_ASSOC);
 
-        $stmt = $this->db->prepare(
-            'INSERT INTO voices (id, name, description, provider, tags) VALUES (:id, :name, :description, :provider, :tags)'
-        );
-
-        foreach ($voices as $voice) {
-            $stmt->bindValue(':id', $voice['id'], SQLITE3_TEXT);
-            $stmt->bindValue(':name', $voice['name'], SQLITE3_TEXT);
-            $stmt->bindValue(':description', $voice['description'], SQLITE3_TEXT);
-            $stmt->bindValue(':provider', $voice['provider'], SQLITE3_TEXT);
-            $stmt->bindValue(':tags', $voice['tags'], SQLITE3_TEXT);
-            $stmt->execute();
-        }
-    }
-
-    /**
-     * Persist a generation record for analytics, caching and audit.
-     */
-    public function saveGeneration(array $data): void
-    {
-        $stmt = $this->db->prepare('
-            INSERT INTO generations (
-                hash, text, voice_id, provider, format, duration,
-                metadata, audio_size_bytes, generated_at
-            ) VALUES (
-                :hash, :text, :voice_id, :provider, :format, :duration,
-                :metadata, :audio_size_bytes, :generated_at
-            )
-        ');
-
-        $stmt->bindValue(':hash', $data['hash'] ?? '', SQLITE3_TEXT);
-        $stmt->bindValue(':text', $data['text'] ?? '', SQLITE3_TEXT);
-        $stmt->bindValue(':voice_id', $data['voice_id'] ?? '', SQLITE3_TEXT);
-        $stmt->bindValue(':provider', $data['provider'] ?? 'elevenlabs', SQLITE3_TEXT);
-        $stmt->bindValue(':format', $data['format'] ?? 'mp3', SQLITE3_TEXT);
-        $stmt->bindValue(':duration', $data['duration'] ?? null, SQLITE3_FLOAT);
-        $metadata = $data['metadata'] ?? [];
-        $stmt->bindValue(':metadata', is_array($metadata) ? json_encode($metadata) : (string) $metadata, SQLITE3_TEXT);
-        $stmt->bindValue(':audio_size_bytes', $data['audio_size_bytes'] ?? 0, SQLITE3_INTEGER);
-        $stmt->bindValue(':generated_at', $data['generated_at'] ?? (new DateTimeImmutable())->format('Y-m-d H:i:s'), SQLITE3_TEXT);
-
-        $stmt->execute();
-    }
-
-    /**
-     * Retrieve cached generation by content hash.
-     */
-    public function findByHash(string $hash): ?array
-    {
-        $stmt = $this->db->prepare('SELECT * FROM generations WHERE hash = :hash LIMIT 1');
-        $stmt->bindValue(':hash', $hash, SQLITE3_TEXT);
-        $result = $stmt->execute();
-        $row = $result->fetchArray(SQLITE3_ASSOC);
-
-        if ($row === false) {
-            return null;
+        if ($user && password_verify($password, $user['password_hash'])) {
+            unset($user['password_hash']);
+            return $user;
         }
 
-        if (isset($row['metadata']) && is_string($row['metadata'])) {
-            $row['metadata'] = json_decode($row['metadata'], true) ?? [];
-        }
-
-        return $row;
+        return null;
     }
 
-    /**
-     * Return all voices from the library.
-     *
-     * @return array<array<string, mixed>>
-     */
     public function listLibrary(): array
     {
-        $result = $this->db->query('SELECT * FROM voices ORDER BY name ASC');
-        $voices = [];
-
-        while ($row = $result->fetchArray(SQLITE3_ASSOC)) {
-            if (isset($row['tags']) && is_string($row['tags'])) {
-                $row['tags'] = json_decode($row['tags'], true) ?? [];
-            }
-            $voices[] = $row;
-        }
-
-        return $voices;
-    }
-
-    /**
-     * Return usage statistics for the dashboard.
-     */
-    public function getUsageStats(): array
-    {
-        $generations = (int) $this->db->querySingle('SELECT COUNT(*) FROM generations');
-
-        $agg = $this->db->query('
-            SELECT 
-                COALESCE(SUM(duration), 0) as total_duration,
-                COALESCE(SUM(audio_size_bytes), 0) as total_bytes
-            FROM generations
-        ')->fetchArray(SQLITE3_ASSOC);
-
-        $hours = (float) ($agg['total_duration'] ?? 0) / 3600.0;
-        // Mock cost based on character usage (real implementation would parse metadata)
-        $estCost = round($generations * 0.018, 2);
-
         return [
-            'generations' => $generations,
-            'cost' => number_format($estCost, 2),
-            'hours' => round($hours, 2),
-            'total_bytes' => (int) ($agg['total_bytes'] ?? 0),
+            ['id' => '21m00Tcm4TlvDq8ikWAM', 'name' => 'Rachel', 'description' => 'American • Warm & versatile', 'provider' => 'elevenlabs'],
+            ['id' => 'AZnzlkDJ2myd1k8p7Q6X', 'name' => 'Domi', 'description' => 'American • Upbeat & clear', 'provider' => 'elevenlabs'],
+            ['id' => 'pNInz6obpgDQGcFmaJgB', 'name' => 'Adam', 'description' => 'American • Deep & authoritative', 'provider' => 'elevenlabs'],
+            ['id' => 'EXAVITQu4vr4xnSDxMaL', 'name' => 'Bella', 'description' => 'American • Friendly & expressive', 'provider' => 'elevenlabs'],
+            ['id' => 'local-lessac', 'name' => 'Lessac (Local)', 'description' => 'Piper • Offline high-quality', 'provider' => 'piper'],
         ];
     }
 
-    /**
-     * Return recent generation history (used by API and future UI).
-     *
-     * @return array<array<string, mixed>>
-     */
-    public function getHistory(int $limit = 20): array
+    public function getHistory(int $limit = 20, ?int $userId = null): array
     {
-        $stmt = $this->db->prepare('
-            SELECT 
-                id,
-                text,
-                voice_id,
-                provider,
-                duration,
-                metadata,
-                generated_at
-            FROM generations 
-            ORDER BY generated_at DESC 
-            LIMIT :limit
-        ');
-        $stmt->bindValue(':limit', max(1, min(200, $limit)), SQLITE3_INTEGER);
-        $result = $stmt->execute();
-
-        $history = [];
-        while ($row = $result->fetchArray(SQLITE3_ASSOC)) {
-            if (isset($row['metadata']) && is_string($row['metadata'])) {
-                $row['metadata'] = json_decode($row['metadata'], true) ?? [];
-            }
-            $history[] = $row;
+        $sql = 'SELECT * FROM generations WHERE 1=1';
+        $params = [];
+        if ($userId !== null) {
+            $sql .= ' AND user_id = ?';
+            $params[] = $userId;
         }
+        $sql .= ' ORDER BY generated_at DESC LIMIT ?';
+        $params[] = $limit;
 
-        return $history;
+        $stmt = $this->pdo->prepare($sql);
+        $stmt->execute($params);
+        return $stmt->fetchAll(PDO::FETCH_ASSOC);
     }
 
-    public function __destruct()
+    public function getUsageStats(?int $userId = null): array
     {
-        if (isset($this->db)) {
-            $this->db->close();
+        $sql = 'SELECT COUNT(*) as generations, SUM(audio_size_bytes) as bytes, SUM(duration) as hours FROM generations';
+        $params = [];
+        if ($userId !== null) {
+            $sql .= ' WHERE user_id = ?';
+            $params[] = $userId;
         }
+
+        $stmt = $this->pdo->prepare($sql);
+        $stmt->execute($params);
+        $stats = $stmt->fetch(PDO::FETCH_ASSOC);
+
+        return [
+            'generations' => (int) ($stats['generations'] ?? 0),
+            'cost' => round(((int) ($stats['bytes'] ?? 0)) / 100000, 2),
+            'hours' => round(((float) ($stats['hours'] ?? 0)) / 3600, 1),
+        ];
+    }
+
+    public function saveGeneration(array $data): void
+    {
+        $sql = 'INSERT INTO generations (
+                    hash, user_id, text, voice_id, provider, format, 
+                    duration, metadata, audio_content, audio_size_bytes, generated_at
+                ) VALUES (
+                    :hash, :user_id, :text, :voice_id, :provider, :format, 
+                    :duration, :metadata, :audio_content, :audio_size_bytes, :generated_at
+                )';
+
+        $stmt = $this->pdo->prepare($sql);
+        $stmt->execute([
+            'hash' => $data['hash'] ?? hash('sha256', ($data['text'] ?? '') . ($data['voice_id'] ?? '')),
+            'user_id' => $data['user_id'] ?? 1,
+            'text' => $data['text'] ?? '',
+            'voice_id' => $data['voice_id'] ?? '',
+            'provider' => $data['provider'] ?? 'elevenlabs',
+            'format' => $data['format'] ?? 'mp3',
+            'duration' => $data['duration'] ?? null,
+            'metadata' => is_array($data['metadata'] ?? null) ? json_encode($data['metadata']) : ($data['metadata'] ?? null),
+            'audio_content' => $data['audio_content'] ?? null,
+            'audio_size_bytes' => $data['audio_size_bytes'] ?? strlen($data['audio_content'] ?? ''),
+            'generated_at' => $data['generated_at'] ?? (new DateTimeImmutable())->format('Y-m-d H:i:s'),
+        ]);
+    }
+
+    public function getCachedSynthesis(string $hash): ?array
+    {
+        $stmt = $this->pdo->prepare(
+            'SELECT audio_content, format, duration, metadata 
+             FROM generations 
+             WHERE hash = ? AND audio_content IS NOT NULL 
+             LIMIT 1'
+        );
+        $stmt->execute([$hash]);
+        $row = $stmt->fetch(PDO::FETCH_ASSOC);
+
+        if ($row && $row['audio_content'] !== null) {
+            $row['metadata'] = $row['metadata'] ? json_decode($row['metadata'], true) : [];
+            return $row;
+        }
+
+        return null;
     }
 }

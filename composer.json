@@ -3,10 +3,11 @@
   "description": "Self-hosted PHP platform for secure AI text-to-speech, voice management and workflow automation",
   "type": "project",
   "license": "MIT",
-  "keywords": ["tts", "ai", "elevenlabs", "openai", "self-hosted", "voice"],
+  "keywords": ["tts", "ai", "elevenlabs", "openai", "self-hosted", "voice", "piper", "local-tts"],
   "require": {
     "php": ">=8.2",
     "guzzlehttp/guzzle": "^7.8",
+    "symfony/process": "^6.4",
     "psr/log": "^3.0",
     "ext-sqlite3": "*",
     "ext-sodium": "*",
