@@ -197,26 +197,26 @@ final class DashboardController
                 $onclick = "alert('User management coming in v0.2');return false;";
             }
 
-            $navHtml .= <<<-HTML
+            $navHtml .= <<<HTML
             <a href="{$item['href']}" onclick="{$onclick}" class="flex items-center gap-x-3 px-4 py-3 rounded-2xl text-sm font-medium transition-colors {$isActive}">
                 <span class="text-xl">{$item['icon']}</span>
                 <span>{$item['label']}</span>
             </a>
-            HTML;
+HTML;
         }
 
-        $userPill = <<<-HTML
+        $userPill = <<<HTML
             <div class="flex items-center gap-x-2 bg-zinc-800 rounded-3xl pl-2 pr-5 h-9">
                 <div class="w-6 h-6 bg-amber-300 rounded-2xl flex items-center justify-center text-amber-800 text-xs font-bold">{$username[0]}</div>
                 <div class="text-sm">{$username}</div>
-            HTML;
+HTML;
 
         if ($isAdmin) {
             $userPill .= '<div class="ml-2 px-2 text-[10px] bg-violet-600 rounded-3xl text-white">ADMIN</div>';
         }
         $userPill .= '</div>';
 
-        return <<<-HTML
+        return <<<HTML
 <!DOCTYPE html>
 <html lang="en" class="dark">
 <head>
@@ -385,7 +385,7 @@ HTML;
             ? '<div class="mb-6 p-4 bg-red-950 border border-red-500 text-red-400 rounded-3xl text-sm">Invalid username or password.</div>'
             : '';
 
-        return <<<-HTML
+        return <<<HTML
 <!DOCTYPE html>
 <html lang="en" class="dark">
 <head>
@@ -461,12 +461,12 @@ HTML;
     {
         $voicesHtml = '';
         foreach ($this->demoVoices as $voice) {
-            $voicesHtml .= <<<-HTML
+            $voicesHtml .= <<<HTML
 <option value="{$voice['id']}">{$voice['name']} — {$voice['description']}</option>
 HTML;
         }
 
-        return <<<-HTML
+        return <<<HTML
 <div class="max-w-2xl mx-auto">
     <div class="mb-8">
         <h1 class="text-5xl font-semibold tracking-tighter text-white logo-font">Speak now.</h1>
@@ -613,7 +613,7 @@ HTML;
 
         $itemsHtml = '';
         foreach ($libraryItems as $voice) {
-            $itemsHtml .= <<<-HTML
+            $itemsHtml .= <<<HTML
 <div class="bg-zinc-900 border border-zinc-700 rounded-3xl p-6 hover:border-emerald-500 transition group">
     <div class="flex justify-between">
         <div>
@@ -637,7 +637,7 @@ HTML;
 HTML;
         }
 
-        return <<<-HTML
+        return <<<HTML
 <div>
     <div class="flex items-center justify-between mb-8">
         <div>
@@ -669,7 +669,7 @@ HTML;
         $meta = $info['metadata'] ?? [];
         $characterCount = $meta['character_count'] ?? '142';
 
-        return <<<-HTML
+        return <<<HTML
 <div class="rounded-3xl bg-gradient-to-br from-zinc-800 to-zinc-900 border border-emerald-900 p-7 shadow-2xl">
     <div class="flex items-center gap-x-4 mb-6">
         <div class="rounded-2xl bg-emerald-900 w-9 h-9 flex items-center justify-center flex-shrink-0">
