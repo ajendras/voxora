@@ -192,6 +192,61 @@ final class ApiController
         ]);
     }
 
+    /**
+     * POST /api/v1/clone-voice
+     *
+     * Voice cloning workflow: accepts name + sample file upload, calls
+     * Manager::cloneVoice() (which hits provider API), persists the voice.
+     */
+    public function cloneVoiceAction(Request $request): Response
+    {
+        $token = $this->validateToken($request, 'tts:generate');
+        if ($token === null) {
+            return Response::json([
+                'error' => 'Unauthorized - valid token with tts:generate scope required',
+                'code' => 'invalid_token'
+            ], 401);
+        }
+
+        $name = trim($request->getPost('name', ''));
+        if ($name === '') {
+            return Response::json(['error' => 'name parameter is required'], 400);
+        }
+
+        if (!isset($_FILES['sample']) || $_FILES['sample']['error'] !== UPLOAD_ERR_OK) {
+            return Response::json(['error' => 'sample file upload is required'], 400);
+        }
+
+        $sample = $_FILES['sample'];
+        $allowed = ['audio/mpeg', 'audio/wav', 'audio/x-wav', 'audio/mp3'];
+        if (!in_array($sample['type'], $allowed, true)) {
+            return Response::json(['error' => 'Only MP3 and WAV files are allowed for cloning'], 400);
+        }
+
+        $samplePath = $sample['tmp_name'];
+
+        try {
+            $voiceId = $this->ttsManager->cloneVoice(
+                $name,
+                $samplePath,
+                'elevenlabs',
+                $token->userId ?? 1
+            );
+
+            return Response::json([
+                'success' => true,
+                'voice_id' => $voiceId,
+                'name' => $name,
+                'provider' => 'elevenlabs',
+                'message' => 'Voice successfully cloned via provider API and persisted. Use the voice_id in synthesis requests.',
+            ]);
+        } catch (InvalidArgumentException $e) {
+            return Response::json(['error' => $e->getMessage()], 400);
+        } catch (RuntimeException $e) {
+            return Response::json(['error' => 'Cloning failed: ' . $e->getMessage()], 502);
+        }
+    }
+
     private function validateToken(Request $request, string $requiredScope = ''): ?Token
     {
         $authHeader = $request->getHeader('Authorization') ?? $request->getHeader('X-Api-Key') ?? '';

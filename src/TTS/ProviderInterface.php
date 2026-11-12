@@ -4,75 +4,38 @@ declare(strict_types=1);
 
 namespace Voxora\TTS;
 
+use Voxora\TTS\SynthesisResult;
+
 /**
  * ProviderInterface
  *
- * Defines the contract for all Text-to-Speech providers (ElevenLabs, OpenAI, Azure, local, etc).
- * Implementations must return a SynthesisResult containing binary audio and metadata.
+ * Common contract for all TTS backends. New providers must implement
+ * both synthesis and voice cloning capabilities (Piper throws on clone).
  */
 interface ProviderInterface
 {
     /**
-     * Synthesize speech from text using the given voice and options.
+     * Synthesize text to speech.
      *
-     * @param string $text Text to be spoken (max length enforced by provider)
-     * @param array $voice Voice descriptor: ['id' => string, 'name' => string, 'provider' => string, ...]
-     * @param array $options Provider-specific options (stability, similarity_boost, speed, model, etc.)
-     * @return SynthesisResult Binary audio data and associated metadata
-     * @throws \RuntimeException When the provider API returns an error or audio cannot be generated
+     * @param string $text The text to speak
+     * @param string $voiceId Voice identifier (model for Piper, voice_id for ElevenLabs)
+     * @param array<string, mixed> $options Additional provider-specific options (stability, similarity_boost etc)
      */
-    public function synthesize(string $text, array $voice, array $options = []): SynthesisResult;
-}
-
-/**
- * SynthesisResult
- *
- * Immutable value object returned by all TTS providers. Contains the generated audio
- * and metadata for caching, analytics, and file storage.
- */
-final class SynthesisResult
-{
-    /**
-     * @param string $audioContent Raw binary audio content (MP3 by default)
-     * @param string $format File format (mp3, wav, etc.)
-     * @param float|null $duration Duration in seconds (if known from provider response)
-     * @param array $metadata Additional provider-specific data (voice_id, model, usage, etc.)
-     */
-    public function __construct(
-        public readonly string $audioContent,
-        public readonly string $format = 'mp3',
-        public readonly ?float $duration = null,
-        public readonly array $metadata = []
-    ) {
-        if (empty($audioContent)) {
-            throw new \InvalidArgumentException('Audio content cannot be empty.');
-        }
-        if (!in_array($format, ['mp3', 'wav'], true)) {
-            throw new \InvalidArgumentException('Unsupported audio format: ' . $format);
-        }
-    }
+    public function synthesize(string $text, string $voiceId, array $options = []): SynthesisResult;
 
     /**
-     * Persist the audio to a file (creates directory if needed).
+     * Create a cloned voice from an audio sample file.
+     * 
+     * @param string $name Friendly name for the cloned voice
+     * @param string $samplePath Path to audio sample (WAV/MP3 recommended, >30s ideal for ElevenLabs)
+     * @return string The new voice identifier to use in synthesize()
+     * @throws \InvalidArgumentException if sample is invalid
+     * @throws \RuntimeException on API failure
      */
-    public function save(string $filepath): bool
-    {
-        $directory = dirname($filepath);
-        if (!is_dir($directory)) {
-            if (!mkdir($directory, 0755, true) && !is_dir($directory)) {
-                throw new \RuntimeException('Failed to create audio directory: ' . $directory);
-            }
-        }
-
-        return file_put_contents($filepath, $this->audioContent) !== false;
-    }
+    public function cloneVoice(string $name, string $samplePath): string;
 
     /**
-     * Returns a data URI suitable for browser preview.
+     * Returns a unique name for this provider (used for routing in Manager).
      */
-    public function toDataUri(): string
-    {
-        $mime = $this->format === 'mp3' ? 'audio/mpeg' : 'audio/wav';
-        return 'data:' . $mime . ';base64,' . base64_encode($this->audioContent);
-    }
+    public function getName(): string;
 }

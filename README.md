@@ -28,6 +28,7 @@ Developers integrating high-quality voices face fragmented provider APIs, expose
 - **Zero-copy automation** — `BatchGenerator::run()` turns a CSV into dozens of MP3s in one call, with optional progress callbacks and a full `Report`.
 - **Instant UI + REST** — Responsive HTMX/Tailwind dashboard and a token-protected JSON API let you preview, download or embed speech from any app.
 - **Local fallback** — Seamless offline synthesis via Piper when cloud providers are unavailable.
+- **Voice cloning** — Upload audio samples directly to provider APIs (`Manager::cloneVoice()`) with results persisted as reusable custom voices.
 
 ## 🎬 Demo
 
@@ -76,6 +77,12 @@ Usage stats, history and cost tracking through <code>SqliteRepository::getUsageS
 <td valign="top">
 📢 <b>Local TTS</b><br>
 Piper fallback via Symfony Process — fully offline synthesis on cloud failure
+</td>
+</tr>
+<tr>
+<td valign="top" colspan="3">
+🔄 <b>Voice Cloning</b><br>
+Upload sample audio via <code>/api/v1/clone-voice</code> or Library UI; <code>Manager::cloneVoice()</code> calls provider APIs (ElevenLabs /v1/voices/add), persists voice_id in SQLite for immediate reuse
 </td>
 </tr>
 </table>
@@ -140,13 +147,22 @@ $kernel->boot();
 
 $manager = $kernel->getTtsManager();
 
+// Voice cloning workflow
+$voiceId = $manager->cloneVoice(
+    name: "My Custom Narrator",
+    samplePath: __DIR__ . "/samples/narrator.wav",
+    provider: "elevenlabs"
+);
+echo "Cloned voice ready: $voiceId\n";
+
+// Standard synthesis with cloned voice
 $result = $manager->generate(
-    text: "Hello from Voxora — self-hosted AI speech.",
-    voiceId: "21m00Tcm4TlvDq8ikWAM",
-    provider: "elevenlabs" // falls back to "piper" on error
+    text: "Hello from your cloned voice.",
+    voiceId: $voiceId,
+    provider: "elevenlabs"
 );
 
-$result->save('output/hello.mp3');
+$result->save('output/cloned.mp3');
 echo "Saved! Duration: " . ($result->duration ?? 'unknown') . "s\n";
 ```
 
@@ -164,6 +180,30 @@ After login the top bar reflects the current user and role. Admins see additiona
 ### Dashboard synthesis (HTMX)
 
 Visit `/dashboard` (after login), fill the form and click **GENERATE SPEECH**. The `DashboardController::generateAction()` returns a live audio fragment with player, download button and metadata. Stats and history are scoped to the logged-in user.
+
+### Voice cloning workflow
+
+**Via API (recommended for scripts):**
+
+```bash
+curl -X POST http://localhost:8080/api/v1/clone-voice \
+  -H "X-Api-Key: vxo_..." \
+  -F "name=My Narrator" \
+  -F "sample=@/path/to/sample.wav"
+```
+
+**Via Dashboard:** Visit /library. The "Clone New Voice" form accepts an audio sample (MP3/WAV), sends it to the ElevenLabs API, stores the resulting voice_id and displays it with a CLONED badge. Cloned voices are instantly selectable in the synthesis form.
+
+**Via code:**
+
+```php
+$voiceId = $manager->cloneVoice(
+    name: "My Custom Narrator",
+    samplePath: "samples/narrator.wav"
+);
+```
+
+The sample is posted as multipart to the provider, the voice is persisted in the `voices` SQLite table (with `is_cloned=1`), and can be used in any `generate()` call.
 
 ### Issue a scoped API token
 
@@ -215,7 +255,7 @@ curl -X POST http://localhost:8080/api/v1/speech \
   -d 'text=Welcome to the control plane.&voice_id=21m00Tcm4TlvDq8ikWAM'
 ```
 
-Provider can be set to `piper` for local synthesis.
+Provider can be set to `piper` for local synthesis. Use `/api/v1/clone-voice` for cloning.
 
 ## 🔧 Configuration
 
@@ -242,21 +282,24 @@ flowchart TD
     Kernel --> Session[session_start + Auth]
     Kernel --> Router[Router]
     Router --> Dashboard[DashboardController<br>(login, index, generate)]
-    Router --> Api[ApiController]
+    Router --> Api[ApiController<br>(cloneVoiceAction)]
     Api --> KeyManager[KeyManager::validate<br>(role + userId)]
-    Api --> Manager[TTS\Manager::generate]
+    Api --> Manager[TTS\Manager::generate or cloneVoice]
     Dashboard --> Manager
     Manager --> Provider[ProviderInterface]
-    Provider --> ElevenLabs[ElevenLabsProvider]
-    Provider --> Piper[PiperProvider]
+    Provider --> ElevenLabs[ElevenLabsProvider<br>(/voices/add for cloning)]
+    Provider --> Piper[PiperProvider<br>(throws on clone)]
     Manager --> Fallback[Fallback to Piper on cloud error]
-    Manager --> Repo[SqliteRepository<br>(users, generations with user_id + audio cache)]
+    Manager --> Repo[SqliteRepository<br>(users, generations, voices with is_cloned)]
+    Upload[Sample Upload] --> Api
+    Api --> Manager
+    Manager --> Repo[saveCustomVoice]
     Batch[BatchGenerator::run] --> Manager
     Manager --> Synthesis[SynthesisResult<br>(save, toDataUri)]
     Users[(users table<br>role-based)]
 ```
 
-`Kernel` wires together `KeyManager`, `TTS\Manager`, `SqliteRepository` and the two controllers. All synthesis paths converge on `Manager::generate()`, which selects a `ProviderInterface` implementation, caches results and records usage. The dashboard uses HTMX fragments while the API returns JSON with public audio URLs. Sessions + `users` table enable multi-user isolation and role checks (`admin` vs `user`). Piper is used as automatic fallback for offline/resilient operation.
+`Kernel` wires together `KeyManager`, `TTS\Manager`, `SqliteRepository` and the two controllers. All synthesis paths converge on `Manager::generate()`, which selects a `ProviderInterface` implementation, caches results and records usage. The dashboard uses HTMX fragments while the API returns JSON with public audio URLs. Sessions + `users` table enable multi-user isolation and role checks (`admin` vs `user`). Piper is used as automatic fallback for offline/resilient operation. Voice cloning is handled by `Manager::cloneVoice()` which delegates to the provider, stores the voice, and makes it available in `listLibrary()`.
 
 ## 📁 Project structure
 
@@ -271,16 +314,16 @@ flowchart TD
 │   ├── Security/
 │   │   └── KeyManager.php        # issueToken(), validate(), Token (now with role/userId), User concepts
 │   ├── TTS/
-│   │   ├── ProviderInterface.php # synthesize(text, voice, options)
-│   │   ├── ElevenLabsProvider.php
-│   │   ├── PiperProvider.php     # local synthesis via Symfony Process + WAV output
+│   │   ├── ProviderInterface.php # synthesize() + cloneVoice()
+│   │   ├── ElevenLabsProvider.php # implements cloning via /v1/voices/add
+│   │   ├── PiperProvider.php     # local synthesis via Symfony Process + WAV output (throws on clone)
 │   │   ├── SynthesisResult.php   # common result value object (mp3/wav)
-│   │   └── Manager.php           # generate() with caching, usage recording & Piper fallback
+│   │   └── Manager.php           # generate() with caching, usage recording & Piper fallback; cloneVoice()
 │   ├── Http/
 │   │   ├── DashboardController.php # HTMX pages + generateAction + login/logout
-│   │   └── ApiController.php     # speechAction, historyAction, issueTokenAction (role-aware)
+│   │   └── ApiController.php     # speechAction, historyAction, issueTokenAction, cloneVoiceAction (role-aware)
 │   ├── Storage/
-│   │   └── SqliteRepository.php  # schema (users + user_id), authenticate(), getUser(), scoped queries
+│   │   └── SqliteRepository.php  # schema (users + voices with is_cloned), authenticate(), listLibrary(), saveCustomVoice()
 │   └── Automation/
 │       └── BatchGenerator.php    # run(csvPath, progress), Report value object
 ├── examples/
@@ -299,7 +342,7 @@ composer test
 vendor/bin/phpunit
 ```
 
-The test suite covers `KeyManager` token issuance, validation, expiry checks, encryption round-trips, scope enforcement and the new role/userId fields. New unit tests validate Piper WAV duration parsing and fallback paths.
+The test suite covers `KeyManager` token issuance, validation, expiry checks, encryption round-trips, scope enforcement and the new role/userId fields. New unit tests validate Piper WAV duration parsing and fallback paths. `PiperProviderTest` now also asserts that `cloneVoice()` throws the expected exception.
 
 ## 📍 Roadmap
 
@@ -307,7 +350,7 @@ The test suite covers `KeyManager` token issuance, validation, expiry checks, en
 - [x] **v0.1.0** — first release: Secure Vault, Unified Engine, Instant Synth, Batch Runner
 - [x] Add user authentication and role-based multi-user support
 - [x] Local TTS fallback via Piper using Symfony Process component
-- [ ] Voice cloning workflow with sample upload to provider APIs
+- [x] Voice cloning workflow with sample upload to provider APIs
 - [ ] Rich SSML editor with live preview inside dashboard
 - [ ] FFmpeg integration for normalization, loudness and format conversion
 - [ ] Interactive usage analytics dashboard with Chart.js charts

@@ -12,102 +12,117 @@ use RuntimeException;
 /**
  * ElevenLabsProvider
  *
- * Concrete implementation of ProviderInterface for the ElevenLabs TTS API.
- * Constructs authenticated requests to the text-to-speech endpoint, maps
- * stability/similarity_boost settings, and returns a standardized SynthesisResult.
+ * Uses ElevenLabs API for high-quality neural TTS and voice cloning.
  */
 final class ElevenLabsProvider implements ProviderInterface
 {
     private Client $client;
     private string $apiKey;
 
-    /**
-     * @param string $apiKey ElevenLabs API key (must be valid, not placeholder)
-     * @param string $baseUri Base URI for the API (allows overrides for testing)
-     */
     public function __construct(string $apiKey, string $baseUri = 'https://api.elevenlabs.io/v1')
     {
         if (empty($apiKey) || str_starts_with($apiKey, 'sk-...')) {
-            throw new InvalidArgumentException('A valid ElevenLabs API key must be provided.');
+            throw new InvalidArgumentException('Valid ElevenLabs API key is required.');
         }
-
         $this->apiKey = $apiKey;
-
         $this->client = new Client([
-            'base_uri' => rtrim($baseUri, '/') . '/',
-            'timeout' => 30.0,
-            'http_errors' => false,
+            'base_uri' => $baseUri,
             'headers' => [
-                'xi-api-key' => $this->apiKey,
-                'Content-Type' => 'application/json',
+                'xi-api-key' => $apiKey,
                 'Accept' => 'audio/mpeg',
-                'User-Agent' => 'Voxora/1.0',
             ],
+            'timeout' => 30,
         ]);
     }
 
-    public function synthesize(string $text, array $voice, array $options = []): SynthesisResult
+    public function synthesize(string $text, string $voiceId, array $options = []): SynthesisResult
     {
-        $text = trim($text);
-        if ($text === '') {
+        if (trim($text) === '') {
             throw new InvalidArgumentException('Text cannot be empty.');
         }
 
-        $voiceId = trim($voice['id'] ?? '');
-        if ($voiceId === '') {
-            throw new InvalidArgumentException('Voice descriptor must contain a valid "id".');
-        }
-
-        $model = $options['model'] ?? 'eleven_monolingual_v1';
-        $stability = max(0.0, min(1.0, (float) ($options['stability'] ?? 0.5)));
-        $similarityBoost = max(0.0, min(1.0, (float) ($options['similarity_boost'] ?? 0.75)));
-
         $payload = [
             'text' => $text,
-            'model_id' => $model,
+            'model_id' => 'eleven_monolingual_v1',
             'voice_settings' => [
-                'stability' => $stability,
-                'similarity_boost' => $similarityBoost,
-                'style' => 0.0,
-                'use_speaker_boost' => true,
+                'stability' => $options['stability'] ?? 0.5,
+                'similarity_boost' => $options['similarity_boost'] ?? 0.75,
             ],
         ];
 
         try {
-            $response = $this->client->post("text-to-speech/{$voiceId}", [
+            $response = $this->client->post("/text-to-speech/{$voiceId}", [
                 'json' => $payload,
             ]);
 
-            if ($response->getStatusCode() !== 200) {
-                $body = (string) $response->getBody();
-                throw new RuntimeException("ElevenLabs API error ({$response->getStatusCode()}): {$body}");
-            }
-
             $audioContent = (string) $response->getBody();
-            if ($audioContent === '') {
-                throw new RuntimeException('Empty audio response received from ElevenLabs.');
-            }
+
+            $estimatedDuration = max(1.0, strlen($audioContent) / 32000);
 
             return new SynthesisResult(
-                $audioContent,
-                'mp3',
-                null,
-                [
+                audioContent: $audioContent,
+                format: 'mp3',
+                duration: $estimatedDuration,
+                metadata: [
                     'provider' => 'elevenlabs',
                     'voice_id' => $voiceId,
-                    'model' => $model,
-                    'stability' => $stability,
-                    'similarity_boost' => $similarityBoost,
-                    'character_count' => mb_strlen($text),
+                    'character_count' => strlen($text),
                 ]
             );
         } catch (GuzzleException $e) {
-            throw new RuntimeException('HTTP request to ElevenLabs failed: ' . $e->getMessage(), 0, $e);
-        } catch (\Throwable $e) {
-            if ($e instanceof RuntimeException) {
-                throw $e;
-            }
-            throw new RuntimeException('Failed to synthesize with ElevenLabs: ' . $e->getMessage(), 0, $e);
+            throw new RuntimeException('ElevenLabs API error: ' . $e->getMessage(), 0, $e);
         }
+    }
+
+    public function cloneVoice(string $name, string $samplePath): string
+    {
+        if (!file_exists($samplePath) || !is_readable($samplePath)) {
+            throw new InvalidArgumentException("Sample file not found or not readable: {$samplePath}");
+        }
+
+        $mimeType = mime_content_type($samplePath);
+        if (!in_array($mimeType, ['audio/mpeg', 'audio/wav', 'audio/x-wav'], true)) {
+            throw new InvalidArgumentException('Sample must be MP3 or WAV audio file.');
+        }
+
+        try {
+            $response = $this->client->post('/v1/voices/add', [
+                'multipart' => [
+                    [
+                        'name' => 'name',
+                        'contents' => $name,
+                    ],
+                    [
+                        'name' => 'files',
+                        'contents' => fopen($samplePath, 'r'),
+                        'filename' => basename($samplePath),
+                        'headers' => [
+                            'Content-Type' => $mimeType,
+                        ],
+                    ],
+                    [
+                        'name' => 'description',
+                        'contents' => 'Cloned via Voxora',
+                    ],
+                ],
+            ]);
+
+            $body = json_decode((string) $response->getBody(), true, 512, JSON_THROW_ON_ERROR);
+
+            if (empty($body['voice_id'])) {
+                throw new RuntimeException('No voice_id returned from cloning API');
+            }
+
+            return $body['voice_id'];
+        } catch (GuzzleException $e) {
+            throw new RuntimeException('Voice cloning failed: ' . $e->getMessage(), 0, $e);
+        } catch (\JsonException $e) {
+            throw new RuntimeException('Invalid response from cloning API');
+        }
+    }
+
+    public function getName(): string
+    {
+        return 'elevenlabs';
     }
 }

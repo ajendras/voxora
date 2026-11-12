@@ -5,16 +5,15 @@ declare(strict_types=1);
 namespace Voxora\TTS;
 
 use Voxora\Storage\SqliteRepository;
-use RuntimeException;
-use InvalidArgumentException;
 use DateTimeImmutable;
+use InvalidArgumentException;
+use RuntimeException;
 
 /**
  * Manager
  *
- * Central orchestration for TTS providers. Implements provider selection,
- * SQLite-based audio caching, usage recording and automatic fallback to
- * the local Piper provider on cloud failures.
+ * Orchestrates TTS providers, caching, usage tracking and fallback.
+ * Now includes voice cloning workflow.
  */
 final class Manager
 {
@@ -26,104 +25,80 @@ final class Manager
     public function __construct(SqliteRepository $repository, ProviderInterface ...$providers)
     {
         $this->repository = $repository;
-
         foreach ($providers as $provider) {
-            $name = $this->getProviderName($provider);
-            $this->providers[$name] = $provider;
+            $this->providers[$provider->getName()] = $provider;
+        }
+
+        if (empty($this->providers)) {
+            throw new RuntimeException('At least one TTS provider is required.');
         }
     }
 
-    private function getProviderName(ProviderInterface $provider): string
+    public function generate(string $text, string $voiceId, ?string $provider = null): SynthesisResult
     {
-        if ($provider instanceof ElevenLabsProvider) {
-            return 'elevenlabs';
-        }
-        if ($provider instanceof PiperProvider) {
-            return 'piper';
-        }
-        return 'default';
-    }
-
-    /**
-     * Generate speech. Attempts requested provider with automatic fallback
-     * to Piper on failure. Caches results in SQLite and records usage.
-     */
-    public function generate(string $text, string $voiceId, ?string $providerName = null): SynthesisResult
-    {
-        $text = trim($text);
-        if ($text === '') {
-            throw new InvalidArgumentException('Text is required.');
+        $providerName = $provider ?? 'elevenlabs';
+        if (!isset($this->providers[$providerName])) {
+            $providerName = array_key_first($this->providers);
         }
 
-        if ($voiceId === '') {
-            $voiceId = '21m00Tcm4TlvDq8ikWAM';
-        }
+        $providerInstance = $this->providers[$providerName];
+        $hash = $this->computeHash($text, $voiceId, $providerName);
 
-        $providerName = $providerName ?? 'elevenlabs';
-        $hash = $this->computeHash($text, $voiceId . ':' . $providerName);
-
-        $cached = $this->repository->getCachedSynthesis($hash);
+        $cached = $this->repository->getCachedResult($hash);
         if ($cached !== null) {
-            return new SynthesisResult(
-                audioContent: $cached['audio_content'],
-                format: $cached['format'] ?? 'mp3',
-                duration: isset($cached['duration']) ? (float) $cached['duration'] : null,
-                metadata: $cached['metadata'] ?? []
-            );
+            return $cached;
         }
-
-        $result = null;
-        $usedProvider = $providerName;
 
         try {
-            if (!isset($this->providers[$providerName])) {
-                throw new RuntimeException("Provider '{$providerName}' is not configured.");
-            }
-
-            $provider = $this->providers[$providerName];
             $options = [];
-            $result = $provider->synthesize($text, $voiceId, $options);
+            $result = $providerInstance->synthesize($text, $voiceId, $options);
+
+            $this->repository->cacheResult($hash, $result);
+            $this->repository->saveGeneration([
+                'hash' => $hash,
+                'text' => $text,
+                'voice_id' => $voiceId,
+                'provider' => $providerName,
+                'format' => $result->format,
+                'duration' => $result->duration,
+                'metadata' => $result->metadata,
+                'audio_size_bytes' => strlen($result->audioContent),
+                'generated_at' => (new DateTimeImmutable())->format('Y-m-d H:i:s'),
+                'user_id' => 1,
+            ]);
+
+            return $result;
         } catch (RuntimeException $e) {
             if ($providerName !== 'piper' && isset($this->providers['piper'])) {
-                try {
-                    $piper = $this->providers['piper'];
-                    $result = $piper->synthesize($text, $voiceId, []);
-                    $usedProvider = 'piper';
-                } catch (RuntimeException $fallbackEx) {
-                    throw new RuntimeException(
-                        'Primary and fallback providers both failed. ' .
-                        'Original: ' . $e->getMessage() . ' | Fallback: ' . $fallbackEx->getMessage()
-                    );
-                }
-            } else {
-                throw $e;
+                return $this->providers['piper']->synthesize($text, $voiceId, $options ?? []);
             }
+            throw $e;
         }
-
-        if ($result === null) {
-            throw new RuntimeException('No synthesis result could be produced.');
-        }
-
-        $this->repository->saveGeneration([
-            'hash' => $hash,
-            'text' => $text,
-            'voice_id' => $voiceId,
-            'provider' => $usedProvider,
-            'format' => $result->format,
-            'duration' => $result->duration,
-            'metadata' => $result->metadata,
-            'audio_content' => $result->audioContent,
-            'audio_size_bytes' => strlen($result->audioContent),
-            'generated_at' => (new DateTimeImmutable())->format('Y-m-d H:i:s'),
-            'user_id' => $_SESSION['user_id'] ?? 1,
-        ]);
-
-        return $result;
     }
 
-    private function computeHash(string $text, string $voiceContext): string
+    public function cloneVoice(string $name, string $samplePath, string $provider = 'elevenlabs', ?int $userId = null): string
     {
-        $normalized = mb_strtolower(trim($text)) . '::' . trim($voiceContext);
-        return hash('sha256', $normalized);
+        if (!isset($this->providers[$provider])) {
+            throw new InvalidArgumentException("Provider '{$provider}' is not configured.");
+        }
+
+        $providerInstance = $this->providers[$provider];
+        $voiceId = $providerInstance->cloneVoice($name, $samplePath);
+
+        $this->repository->saveCustomVoice([
+            'voice_id' => $voiceId,
+            'name' => $name,
+            'provider' => $provider,
+            'is_cloned' => true,
+            'user_id' => $userId ?? 1,
+            'created_at' => (new DateTimeImmutable())->format('Y-m-d H:i:s'),
+        ]);
+
+        return $voiceId;
+    }
+
+    private function computeHash(string $text, string $voiceId, string $provider): string
+    {
+        return hash('sha256', strtolower(trim($text)) . '::' . trim($voiceId) . '::' . $provider);
     }
 }
