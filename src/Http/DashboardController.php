@@ -7,6 +7,7 @@ namespace Voxora\Http;
 use Voxora\TTS\Manager;
 use Voxora\Storage\SqliteRepository;
 use RuntimeException;
+use DateTimeImmutable;
 
 /**
  * DashboardController
@@ -35,811 +36,404 @@ final class DashboardController
         $this->config = $config;
     }
 
-    /**
-     * Render the main dashboard with instant synthesis form and recent activity.
-     */
-    public function index(Request $request): Response
+    public function loginAction(): void
     {
-        if (!isset($_SESSION['user_id'])) {
-            return $this->loginAction($request);
-        }
-
-        $userId = (int) $_SESSION['user_id'];
-        $stats = $this->repository->getUsageStats($userId);
-        $content = $this->renderSynthPanel();
-
-        $currentUser = [
-            'id' => $userId,
-            'username' => $_SESSION['username'] ?? 'user',
-            'role' => $_SESSION['role'] ?? 'user',
-        ];
-
-        $html = $this->renderLayout($content, 'Dashboard', 'dashboard', $stats, $currentUser);
-
-        return Response::html($html);
-    }
-
-    /**
-     * Render the Voice Library page.
-     */
-    public function library(Request $request): Response
-    {
-        if (!isset($_SESSION['user_id'])) {
-            return $this->loginAction($request);
-        }
-
-        $library = $this->repository->listLibrary();
-        $content = $this->renderLibraryPanel($library);
-
-        $currentUser = [
-            'id' => (int) $_SESSION['user_id'],
-            'username' => $_SESSION['username'] ?? 'user',
-            'role' => $_SESSION['role'] ?? 'user',
-        ];
-
-        $html = $this->renderLayout($content, 'Voice Library', 'library', [], $currentUser);
-
-        return Response::html($html);
-    }
-
-    public function loginAction(Request $request): Response
-    {
-        if ($request->getMethod() === 'POST') {
-            $username = trim($request->getPost('username', ''));
-            $password = $request->getPost('password', '');
-
-            if ($username === '' || $password === '') {
-                return Response::html($this->renderLoginForm(true));
+        $error = null;
+        if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+            $username = trim($_POST['username'] ?? '');
+            $password = $_POST['password'] ?? '';
+            if ($username !== '' && $password !== '') {
+                $user = $this->repository->authenticate($username, $password);
+                if ($user !== null) {
+                    session_regenerate_id(true);
+                    $_SESSION['user'] = $user;
+                    header('Location: /dashboard');
+                    exit;
+                }
             }
-
-            $userData = $this->repository->authenticate($username, $password);
-            if ($userData !== null) {
-                $_SESSION['user_id'] = (int) $userData['id'];
-                $_SESSION['username'] = $userData['username'];
-                $_SESSION['role'] = $userData['role'];
-
-                return Response::html('<script>window.location.href = "/dashboard";</script>');
-            }
-
-            return Response::html($this->renderLoginForm(true));
+            $error = 'Invalid username or password.';
         }
-
-        return Response::html($this->renderLoginForm());
+        echo $this->renderLoginPage($error);
     }
 
-    public function logoutAction(Request $request): Response
+    public function logoutAction(): void
     {
-        session_destroy();
-        return Response::html('<script>window.location.href = "/login";</script>');
+        if (session_status() === PHP_SESSION_ACTIVE) {
+            session_destroy();
+        }
+        header('Location: /login');
+        exit;
     }
 
-    /**
-     * Handle synthesis request from HTMX form. Returns only the result fragment.
-     */
-    public function generateAction(Request $request): Response
+    public function indexAction(): void
     {
-        if (!isset($_SESSION['user_id'])) {
-            return Response::html(
-                '<div class="p-6 text-red-600 bg-red-50 dark:bg-red-950 dark:text-red-400 rounded-3xl">Please log in to generate speech.</div>',
-                401
-            );
+        $this->ensureAuthenticated();
+        $user = $_SESSION['user'];
+        $voices = array_merge($this->demoVoices, $this->repository->listLibrary());
+        $history = $this->repository->getHistory(10, $user['id'] ?? 1);
+        $stats = $this->repository->getUsageStats($user['id'] ?? 1);
+        echo $this->renderFullDashboard($voices, $history, $stats, $user);
+    }
+
+    public function generateAction(): string
+    {
+        $this->ensureAuthenticated();
+        if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+            return '<div class="p-4 text-red-500">Invalid request method.</div>';
         }
 
-        $text = trim($request->getPost('text', ''));
-        $voiceId = trim($request->getPost('voice_id', '21m00Tcm4TlvDq8ikWAM'));
-        $stability = (float) ($request->getPost('stability', 0.5));
-        $similarity = (float) ($request->getPost('similarity', 0.75));
+        $text = trim($_POST['text'] ?? '');
+        $voiceId = trim($_POST['voice_id'] ?? '');
+        $provider = $_POST['provider'] ?? null;
 
-        if ($text === '') {
-            return Response::html(
-                '<div class="p-6 text-red-600 bg-red-50 dark:bg-red-950 dark:text-red-400 rounded-3xl">Text is required to generate speech.</div>',
-                400
-            );
-        }
-
-        if ($voiceId === '') {
-            return Response::html(
-                '<div class="p-6 text-red-600 bg-red-50 dark:bg-red-950 dark:text-red-400 rounded-3xl">A voice must be selected.</div>',
-                400
-            );
+        if ($text === '' || $voiceId === '') {
+            return '<div class="p-4 bg-red-100 text-red-700 rounded">Text and Voice ID are required.</div>';
         }
 
         try {
-            $options = [
-                'stability' => $stability,
-                'similarity_boost' => $similarity,
-            ];
+            $result = $this->ttsManager->generate($text, $voiceId, $provider);
 
-            $result = $this->ttsManager->generate($text, $voiceId, 'elevenlabs');
+            $filename = 'synth-' . bin2hex(random_bytes(6)) . '.mp3';
+            $audioDir = $this->config['audio']['directory'] ?? __DIR__ . '/../../storage/audio';
+            if (!is_dir($audioDir)) {
+                mkdir($audioDir, 0755, true);
+            }
+            $path = $audioDir . '/' . $filename;
+            $result->save($path);
 
-            $dataUri = $result->toDataUri();
-            $voiceName = $this->getVoiceName($voiceId);
+            $urlPrefix = $this->config['audio']['public_url_prefix'] ?? '/audio';
+            $url = $urlPrefix . '/' . $filename;
 
-            $fragment = $this->renderResultFragment($text, $voiceName, $dataUri, [
-                'duration' => $result->duration ?? '~3.2',
-                'metadata' => $result->metadata,
+            $this->repository->saveGeneration([
+                'hash' => $this->computeHash($text, $voiceId),
+                'text' => $text,
+                'voice_id' => $voiceId,
+                'provider' => $provider ?? 'elevenlabs',
+                'format' => $result->format ?? 'mp3',
+                'duration' => $result->duration ?? 0.0,
+                'metadata' => $result->metadata ?? [],
+                'audio_size_bytes' => strlen($result->audioContent ?? ''),
+                'generated_at' => (new DateTimeImmutable())->format('Y-m-d H:i:s'),
+                'user_id' => $_SESSION['user']['id'] ?? 1,
             ]);
 
-            return Response::html($fragment);
+            return $this->renderGenerationResult($result, $url, $text, $voiceId);
         } catch (\Throwable $e) {
-            return Response::html(
-                '<div class="p-6 text-red-600 bg-red-50 dark:bg-red-950 dark:text-red-400 rounded-3xl border border-red-200">' .
-                'Synthesis error: ' . htmlspecialchars($e->getMessage()) .
-                '</div>',
-                500
-            );
+            return '<div class="p-4 bg-red-100 text-red-700 rounded">Error: ' . htmlspecialchars($e->getMessage()) . '</div>';
         }
     }
 
-    private function renderLayout(string $mainContent, string $title = 'Voxora', string $active = 'dashboard', array $stats = [], array $currentUser = []): string
+    public function libraryAction(): void
     {
-        $stats = $stats ?: ['generations' => 42, 'cost' => '4.82', 'hours' => '2.1'];
-        $username = htmlspecialchars($currentUser['username'] ?? 'guest');
-        $role = $currentUser['role'] ?? 'user';
-        $isAdmin = $role === 'admin';
-
-        $navItems = [
-            ['key' => 'dashboard', 'label' => 'Dashboard', 'icon' => '◉', 'href' => '/dashboard'],
-            ['key' => 'library', 'label' => 'Voice Library', 'icon' => '♬', 'href' => '/library'],
-            ['key' => 'batch', 'label' => 'Batch Runner', 'icon' => '⟳', 'href' => '#'],
-            ['key' => 'keys', 'label' => 'API Keys', 'icon' => '🔑', 'href' => '#'],
-        ];
-
-        if ($isAdmin) {
-            $navItems[] = ['key' => 'users', 'label' => 'Manage Users', 'icon' => '👤', 'href' => '#'];
-        }
-
-        $navHtml = '';
-        foreach ($navItems as $item) {
-            $isActive = $item['key'] === $active ? 'bg-zinc-100 dark:bg-zinc-800 text-emerald-600' : 'hover:bg-zinc-100 dark:hover:bg-zinc-800';
-            $onclick = '';
-            if ($item['key'] === 'users') {
-                $onclick = "alert('User management coming in v0.2');return false;";
-            }
-
-            $navHtml .= <<<HTML
-            <a href="{$item['href']}" onclick="{$onclick}" class="flex items-center gap-x-3 px-4 py-3 rounded-2xl text-sm font-medium transition-colors {$isActive}">
-                <span class="text-xl">{$item['icon']}</span>
-                <span>{$item['label']}</span>
-            </a>
-HTML;
-        }
-
-        $userPill = <<<HTML
-            <div class="flex items-center gap-x-2 bg-zinc-800 rounded-3xl pl-2 pr-5 h-9">
-                <div class="w-6 h-6 bg-amber-300 rounded-2xl flex items-center justify-center text-amber-800 text-xs font-bold">{$username[0]}</div>
-                <div class="text-sm">{$username}</div>
-HTML;
-
-        if ($isAdmin) {
-            $userPill .= '<div class="ml-2 px-2 text-[10px] bg-violet-600 rounded-3xl text-white">ADMIN</div>';
-        }
-        $userPill .= '</div>';
-
-        return <<<HTML
-<!DOCTYPE html>
-<html lang="en" class="dark">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>{$title} — Voxora</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
-    <style>
-        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Space+Grotesk:wght@500;600&display=swap');
-        :root {
-            --primary: 134 76 61;
-        }
-        .tail-container {
-            font-family: 'Inter', system_ui, sans-serif;
-        }
-        .logo-font {
-            font-family: 'Space Grotesk', sans-serif;
-        }
-        .glass {
-            background: rgba(255,255,255,0.75);
-            backdrop-filter: blur(16px);
-        }
-        .dark .glass {
-            background: rgba(24,24,27,0.75);
-        }
-        .audio-wave {
-            animation: waveform 1.2s infinite ease-in-out;
-        }
-        .ssml-toolbar button {
-            transition: all 0.1s cubic-bezier(0.4, 0, 0.2, 1);
-        }
-        .ssml-toolbar button:hover {
-            transform: translateY(-1px);
-            box-shadow: 0 4px 6px -1px rgb(16 185 129);
-        }
-    </style>
-</head>
-<body class="tail-container bg-zinc-950 text-zinc-200">
-    <div class="flex h-screen">
-        <!-- Sidebar -->
-        <div class="w-72 bg-zinc-900 border-r border-zinc-800 flex flex-col">
-            <div class="px-8 pt-8 pb-6 border-b border-zinc-800">
-                <div class="flex items-center gap-x-3">
-                    <div class="w-9 h-9 bg-emerald-500 text-white rounded-2xl flex items-center justify-center text-2xl leading-none pt-0.5">v</div>
-                    <div>
-                        <span class="logo-font text-3xl font-semibold tracking-tighter text-white">voxora</span>
-                    </div>
-                </div>
-                <p class="text-[10px] text-zinc-500 tracking-[0.5px] mt-1 pl-0.5">SELF-HOSTED TTS</p>
-            </div>
-
-            <div class="px-3 pt-8 flex-1 overflow-auto">
-                {$navHtml}
-            </div>
-
-            <div class="p-4 border-t border-zinc-800 mt-auto">
-                <div class="rounded-3xl bg-zinc-800 p-4 text-xs">
-                    <div class="flex justify-between items-center">
-                        <div class="text-emerald-400">
-                            <i class="fa-solid fa-circle text-[10px]"></i>
-                        </div>
-                        <div class="text-zinc-400">ElevenLabs connected</div>
-                    </div>
-                </div>
-            </div>
-
-            <div class="px-6 py-6 border-t border-zinc-800 text-xs flex items-center justify-between text-zinc-500">
-                <div>© Voxora 2025</div>
-                <a href="/logout" class="hover:text-zinc-300 transition-colors flex items-center gap-x-1">
-                    <i class="fa-solid fa-right-from-bracket"></i>
-                    <span>Logout</span>
-                </a>
-            </div>
-        </div>
-
-        <!-- Main content -->
-        <div class="flex-1 flex flex-col overflow-hidden">
-            <!-- Top bar -->
-            <div class="h-14 border-b border-zinc-800 bg-zinc-900 px-8 flex items-center justify-between">
-                <div class="flex items-center gap-x-8">
-                    <div onclick="history.back()" class="flex items-center gap-x-1.5 text-zinc-400 hover:text-white cursor-pointer transition-colors">
-                        <i class="fa-solid fa-chevron-left text-xs"></i>
-                        <span class="text-sm font-medium">Back</span>
-                    </div>
-                    <div class="h-5 w-px bg-zinc-700"></div>
-                    <div class="text-sm font-medium text-white">{$title}</div>
-                </div>
-
-                <div class="flex items-center gap-x-6">
-                    <div class="flex items-center bg-zinc-800 rounded-3xl text-xs px-5 h-9 gap-x-5">
-                        <div>
-                            <span class="text-emerald-400">{$stats['generations']}</span>
-                            <span class="text-zinc-500 ml-1">generations</span>
-                        </div>
-                        <div class="w-px h-4 bg-zinc-700"></div>
-                        <div>
-                            <span class="text-emerald-400">\${$stats['cost']}</span>
-                            <span class="text-zinc-500 ml-1">spent</span>
-                        </div>
-                    </div>
-
-                    {$userPill}
-                </div>
-            </div>
-
-            <!-- Page content -->
-            <div class="flex-1 overflow-auto p-10 bg-zinc-950">
-                {$mainContent}
-            </div>
-        </div>
-    </div>
-
-    <script>
-        function initializeTailwind() {
-            tailwind.config = {
-                content: [],
-                theme: {
-                    extend: {}
-                }
-            }
-        }
-
-        function updateSlider(slider) {
-            const valEl = document.getElementById(slider.name + '-val');
-            if (valEl) valEl.textContent = slider.value;
-        }
-
-        function downloadAudio(uri, filename = 'speech.mp3') {
-            const link = document.createElement('a');
-            link.href = uri;
-            link.download = filename;
-            document.body.appendChild(link);
-            link.click();
-            document.body.removeChild(link);
-        }
-
-        function copyText(text) {
-            navigator.clipboard.writeText(text).then(() => {
-                const toast = document.createElement('div');
-                toast.style.cssText = 'position:fixed;bottom:24px;right:24px;background:#111; color:#ddd; padding:12px 24px;border-radius:9999px;font-size:13px;box-shadow:0 10px 15px -3px rgb(0 0 0);';
-                toast.textContent = 'Text copied to clipboard';
-                document.body.appendChild(toast);
-                setTimeout(() => toast.remove(), 2200);
-            });
-        }
-
-        function toggleDarkMode() {
-            document.documentElement.classList.toggle('dark');
-        }
-
-        function insertSSMLTag(openTag, closeTag = '') {
-            const textarea = document.getElementById('text-input');
-            if (!textarea) return;
-
-            const start = textarea.selectionStart;
-            const end = textarea.selectionEnd;
-            const text = textarea.value;
-            let selectedText = text.substring(start, end);
-            let replacement;
-
-            if (closeTag !== '') {
-                replacement = openTag + selectedText + closeTag;
-            } else {
-                replacement = openTag;
-            }
-
-            textarea.value = text.substring(0, start) + replacement + text.substring(end);
-
-            let newCursorPos;
-            if (closeTag !== '' && selectedText === '') {
-                newCursorPos = start + openTag.length;
-            } else if (closeTag !== '') {
-                newCursorPos = start + openTag.length + selectedText.length + closeTag.length;
-            } else {
-                newCursorPos = start + openTag.length;
-            }
-
-            textarea.focus();
-            textarea.setSelectionRange(newCursorPos, newCursorPos);
-        }
-
-        function loadSSMLExample(example) {
-            const textarea = document.getElementById('text-input');
-            if (!textarea) return;
-            let sample = '';
-            switch (example) {
-                case 'pause':
-                    sample = 'Hello there. \\n<break time="1.2s"/> \\nHow are you today?';
-                    break;
-                case 'prosody':
-                    sample = 'The quick brown fox. \\n<prosody rate="slow" pitch="-10%">jumps over the lazy dog.</prosody>';
-                    break;
-                case 'emphasis':
-                    sample = 'This is a normal sentence with <emphasis level="strong">very important</emphasis> information.';
-                    break;
-                case 'spell':
-                    sample = 'The password is <say-as interpret-as="spell-out">abc123</say-as>.';
-                    break;
-                default:
-                    sample = 'Hello from the rich SSML editor.';
-            }
-            textarea.value = sample;
-        }
-
-        // Initialize
-        window.onload = function() {
-            initializeTailwind();
-            if (!document.documentElement.classList.contains('dark')) {
-                document.documentElement.classList.add('dark');
-            }
-        }
-
-        window.downloadAudio = downloadAudio;
-        window.copyText = copyText;
-        window.updateSlider = updateSlider;
-        window.toggleDarkMode = toggleDarkMode;
-        window.insertSSMLTag = insertSSMLTag;
-        window.loadSSMLExample = loadSSMLExample;
-    </script>
-</body>
-</html>
-HTML;
+        $this->ensureAuthenticated();
+        $user = $_SESSION['user'];
+        $voices = $this->repository->listLibrary();
+        echo $this->renderLibraryPage($voices, $user);
     }
 
-    private function renderLoginForm(bool $hasError = false): string
+    private function ensureAuthenticated(): void
     {
-        $errorHtml = $hasError
-            ? '<div class="mb-6 p-4 bg-red-950 border border-red-500 text-red-400 rounded-3xl text-sm">Invalid username or password.</div>'
+        if (empty($_SESSION['user'])) {
+            header('Location: /login');
+            exit;
+        }
+    }
+
+    private function computeHash(string $text, string $voiceId): string
+    {
+        $normalized = mb_strtolower(trim($text)) . '::' . trim($voiceId);
+        return hash('sha256', $normalized);
+    }
+
+    private function renderLoginPage(?string $error = null): string
+    {
+        $errorHtml = $error !== null
+            ? '<div class="bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded mb-4">' . htmlspecialchars($error) . '</div>'
             : '';
 
         return <<<HTML
 <!DOCTYPE html>
-<html lang="en" class="dark">
+<html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Login — Voxora</title>
+    <title>Voxora - Login</title>
     <script src="https://cdn.tailwindcss.com"></script>
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
-    <style>
-        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Space+Grotesk:wght@500;600&display=swap');
-        .tail-container { font-family: 'Inter', system_ui, sans-serif; }
-        .logo-font { font-family: 'Space Grotesk', sans-serif; }
-    </style>
 </head>
-<body class="tail-container bg-zinc-950 text-zinc-200 flex items-center justify-center min-h-screen">
-    <div class="w-full max-w-md">
-        <div class="flex justify-center mb-8">
-            <div class="flex items-center gap-x-3">
-                <div class="w-10 h-10 bg-emerald-500 text-white rounded-3xl flex items-center justify-center text-3xl">v</div>
-                <span class="logo-font text-5xl font-semibold tracking-tighter text-white">voxora</span>
+<body class="bg-zinc-950 text-zinc-200">
+    <div class="min-h-screen flex items-center justify-center">
+        <div class="bg-zinc-900 p-8 rounded-2xl shadow-xl w-full max-w-md">
+            <div class="flex justify-center mb-8">
+                <img src="/assets/banner.svg" alt="Voxora" class="h-12">
             </div>
-        </div>
-        
-        <div class="bg-zinc-900 rounded-3xl p-10 shadow-2xl">
-            <h1 class="text-3xl font-semibold text-center mb-2">Welcome back</h1>
-            <p class="text-zinc-400 text-center mb-8">Sign in to access the TTS control plane</p>
-            
+            <h1 class="text-3xl font-bold text-center mb-2">Welcome back</h1>
+            <p class="text-zinc-400 text-center mb-8">Sign in to access the dashboard</p>
             {$errorHtml}
-            
-            <form method="POST" class="space-y-6">
+            <form method="post" class="space-y-6">
                 <div>
-                    <label class="block text-xs font-mono tracking-widest text-zinc-400 mb-2">USERNAME</label>
-                    <input type="text" name="username" required autocomplete="username"
-                           class="w-full bg-zinc-800 border border-transparent focus:border-emerald-500 rounded-3xl px-6 h-14 text-white focus:outline-none">
+                    <label class="block text-sm font-medium mb-2">Username</label>
+                    <input type="text" name="username" value="admin" 
+                           class="w-full bg-zinc-800 border border-zinc-700 rounded-lg px-4 py-3 focus:outline-none focus:border-violet-500">
                 </div>
-                
                 <div>
-                    <label class="block text-xs font-mono tracking-widest text-zinc-400 mb-2">PASSWORD</label>
-                    <input type="password" name="password" required autocomplete="current-password"
-                           class="w-full bg-zinc-800 border border-transparent focus:border-emerald-500 rounded-3xl px-6 h-14 text-white focus:outline-none">
+                    <label class="block text-sm font-medium mb-2">Password</label>
+                    <input type="password" name="password" value="demo123" 
+                           class="w-full bg-zinc-800 border border-zinc-700 rounded-lg px-4 py-3 focus:outline-none focus:border-violet-500">
                 </div>
-                
-                <button type="submit"
-                        class="w-full h-14 bg-white text-zinc-900 hover:bg-amber-200 active:scale-[0.985] transition-all rounded-3xl text-lg font-semibold">
+                <button type="submit" 
+                        class="w-full bg-violet-600 hover:bg-violet-700 transition py-3 rounded-lg font-semibold">
                     SIGN IN
                 </button>
             </form>
-            
-            <div class="mt-8 text-center text-xs text-zinc-500">
-                Default accounts:<br>
-                <span class="font-mono">admin / demo123</span> (administrator)<br>
-                <span class="font-mono">user / demo123</span> (standard user)
+            <div class="mt-6 text-center text-xs text-zinc-500">
+                Default: admin / demo123 • Change in production!
             </div>
         </div>
-        
-        <div class="text-center mt-8 text-zinc-500 text-xs">
-            Self-hosted • Role-based • Secure by default
+    </div>
+</body>
+</html>
+HTML;
+    }
+
+    private function renderFullDashboard(array $voices, array $history, array $stats, array $user): string
+    {
+        $isAdmin = ($user['role'] ?? 'user') === 'admin';
+        $voiceOptions = '';
+        foreach ($voices as $voice) {
+            $id = $voice['id'] ?? ($voice['voice_id'] ?? '');
+            $name = $voice['name'] ?? 'Unnamed';
+            $desc = $voice['description'] ?? '';
+            $cloned = !empty($voice['is_cloned']) ? ' <span class="text-amber-400 text-xs">(CLONED)</span>' : '';
+            $voiceOptions .= "<option value=\"{$id}\">{$name}{$cloned} - {$desc}</option>";
+        }
+
+        $historyHtml = '';
+        foreach ($history as $item) {
+            $historyHtml .= '<div class="flex justify-between py-2 border-b border-zinc-700 text-sm">' .
+                '<div class="truncate max-w-xs">' . htmlspecialchars($item['text'] ?? '') . '</div>' .
+                '<div class="text-zinc-400">' . ($item['duration'] ?? '') . 's</div>' .
+                '</div>';
+        }
+
+        $ssmlToolbar = '
+        <div class="flex gap-1 mb-2 flex-wrap">
+            <button onclick="insertSSML(\'<break time=\"500ms\"/>\')" 
+                    class="px-3 py-1 bg-zinc-800 hover:bg-zinc-700 rounded text-xs">Break</button>
+            <button onclick="wrapSSML(\'prosody\', \'rate=&quot;slow&quot;\')" 
+                    class="px-3 py-1 bg-zinc-800 hover:bg-zinc-700 rounded text-xs">Slow</button>
+            <button onclick="wrapSSML(\'emphasis\', \'level=&quot;strong&quot;\')" 
+                    class="px-3 py-1 bg-zinc-800 hover:bg-zinc-700 rounded text-xs">Emphasis</button>
+            <button onclick="insertSSML(\'<say-as interpret-as=&quot;date&quot;&gt;2025-01-01&lt;/say-as&gt;\')" 
+                    class="px-3 py-1 bg-zinc-800 hover:bg-zinc-700 rounded text-xs">Date</button>
+            <button onclick="insertSSML(\'<prosody pitch=&quot;+10%&quot;&gt;text&lt;/prosody&gt;\')" 
+                    class="px-3 py-1 bg-zinc-800 hover:bg-zinc-700 rounded text-xs">Pitch</button>
+        </div>';
+
+        return <<<HTML
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Voxora Dashboard</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/htmx.org@1.9.12/dist/htmx.min.js"></script>
+    <style>
+        .tail-container { @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap'); }
+        textarea { font-family: monospace; }
+    </style>
+</head>
+<body class="bg-zinc-950 text-zinc-200 font-sans">
+    <div class="flex h-screen">
+        <!-- Sidebar -->
+        <div class="w-64 bg-zinc-900 border-r border-zinc-800 flex flex-col">
+            <div class="p-6 border-b border-zinc-800">
+                <div class="flex items-center gap-3">
+                    <span class="text-2xl">🎙️</span>
+                    <span class="font-bold tracking-tighter text-3xl text-white">voxora</span>
+                </div>
+            </div>
+            <div class="p-3">
+                <a href="/dashboard" class="flex items-center gap-3 px-4 py-3 hover:bg-zinc-800 rounded-xl text-violet-400">
+                    <span>✦</span>
+                    <span class="font-medium">Synthesize</span>
+                </a>
+                <a href="/library" class="flex items-center gap-3 px-4 py-3 hover:bg-zinc-800 rounded-xl">
+                    <span>📚</span>
+                    <span class="font-medium">Voice Library</span>
+                </a>
+                <a href="/history" class="flex items-center gap-3 px-4 py-3 hover:bg-zinc-800 rounded-xl">
+                    <span>📖</span>
+                    <span class="font-medium">History</span>
+                </a>
+            </div>
+            <div class="mt-auto p-4 border-t border-zinc-800">
+                <div class="flex items-center gap-3">
+                    <div class="w-8 h-8 bg-violet-500 rounded-full flex items-center justify-center text-xs font-bold">{$user['username'][0] ?? 'U'}</div>
+                    <div>
+                        <div class="font-medium text-sm">{$user['username'] ?? 'user'}</div>
+                        <div class="text-xs text-zinc-500">{$user['role'] ?? 'user'}</div>
+                    </div>
+                </div>
+                <a href="/logout" class="block mt-6 text-xs text-red-400 hover:text-red-500">Logout</a>
+            </div>
+        </div>
+        <!-- Main content -->
+        <div class="flex-1 overflow-auto">
+            <div class="max-w-5xl mx-auto p-8">
+                <div class="flex justify-between items-center mb-8">
+                    <h1 class="text-4xl font-semibold tracking-tight">Synthesis Studio</h1>
+                    <div class="flex items-center gap-4 text-sm">
+                        <div class="bg-emerald-900 text-emerald-300 px-3 py-1 rounded-full text-xs font-medium">ONLINE</div>
+                        <div>{$stats['total_generations'] ?? 0} generations</div>
+                    </div>
+                </div>
+                <!-- SSML Editor Panel -->
+                <div class="grid grid-cols-12 gap-6">
+                    <div class="col-span-7 bg-zinc-900 rounded-3xl p-8">
+                        <div class="flex items-center justify-between mb-6">
+                            <div class="font-semibold">Text to Speech</div>
+                            <select id="provider-select" name="provider" class="bg-zinc-800 border-0 rounded-2xl px-4 py-2 text-sm">
+                                <option value="elevenlabs">ElevenLabs (Cloud)</option>
+                                <option value="piper">Piper (Local)</option>
+                            </select>
+                        </div>
+                        <form hx-post="/dashboard/generate" hx-target="#generation-result" hx-swap="innerHTML" class="space-y-6">
+                            <div>
+                                <label class="block text-xs uppercase tracking-widest text-zinc-400 mb-3">Voice</label>
+                                <select name="voice_id" class="w-full bg-zinc-800 border border-zinc-700 rounded-2xl px-5 py-4 text-lg focus:outline-none focus:border-violet-400">
+                                    {$voiceOptions}
+                                </select>
+                            </div>
+                            <div>
+                                <label class="block text-xs uppercase tracking-widest text-zinc-400 mb-3">SSML Content</label>
+                                {$ssmlToolbar}
+                                <textarea id="ssml-editor" name="text" rows="6" 
+                                    class="w-full bg-zinc-950 border border-zinc-700 rounded-3xl p-6 font-mono text-sm resize-y focus:outline-none focus:border-violet-400">Hello from <prosody rate="slow">Voxora</prosody>.</textarea>
+                            </div>
+                            <button type="submit" 
+                                    class="bg-white text-zinc-900 px-10 py-4 rounded-2xl font-semibold flex items-center gap-2 hover:scale-105 transition">
+                                <span>GENERATE SPEECH</span>
+                                <span class="text-xl">→</span>
+                            </button>
+                        </form>
+                    </div>
+                    <!-- Preview / Result panel -->
+                    <div class="col-span-5">
+                        <div id="generation-result" class="bg-zinc-900 rounded-3xl p-8 min-h-[420px]">
+                            <div class="flex flex-col items-center justify-center h-full text-center text-zinc-400">
+                                <div class="text-6xl mb-6 opacity-30">🎤</div>
+                                <p class="font-medium">Your audio will appear here</p>
+                                <p class="text-xs mt-2 max-w-[180px]">Live preview with SSML support and metadata</p>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                <!-- Recent History -->
+                <div class="mt-12">
+                    <div class="flex justify-between items-baseline mb-4">
+                        <div class="uppercase text-xs tracking-widest font-medium text-zinc-400">Recent Generations</div>
+                        <a href="/history" class="text-xs text-violet-400 hover:underline">View all →</a>
+                    </div>
+                    <div class="bg-zinc-900 rounded-3xl p-6">
+                        {$historyHtml}
+                    </div>
+                </div>
+            </div>
         </div>
     </div>
-
     <script>
-        function initializeTailwind() {
-            tailwind.config = { content: [], theme: { extend: {} } };
+        function insertSSML(tag) {
+            const editor = document.getElementById('ssml-editor');
+            const start = editor.selectionStart;
+            const end = editor.selectionEnd;
+            editor.value = editor.value.substring(0, start) 
+                + tag 
+                + editor.value.substring(end);
+            editor.focus();
+            editor.selectionStart = editor.selectionEnd = start + tag.length;
         }
-        window.onload = initializeTailwind;
+        function wrapSSML(tag, attrs = '') {
+            const editor = document.getElementById('ssml-editor');
+            let openTag = `<${tag}>`;
+            if (attrs) openTag = `<${tag} ${attrs}>`;
+            const closeTag = `</${tag}>`;
+            const start = editor.selectionStart;
+            const end = editor.selectionEnd;
+            const selected = editor.value.substring(start, end);
+            const replacement = openTag + selected + closeTag;
+            editor.value = editor.value.substring(0, start) 
+                + replacement 
+                + editor.value.substring(end);
+            editor.focus();
+            editor.selectionStart = start + openTag.length;
+            editor.selectionEnd = start + openTag.length + selected.length;
+        }
+        document.addEventListener('htmx:afterSettle', function() {
+            console.log('Generation complete, audio ready');
+        });
     </script>
 </body>
 </html>
 HTML;
     }
 
-    private function renderSynthPanel(): string
+    private function renderGenerationResult($result, string $url, string $text, string $voiceId): string
     {
-        $voicesHtml = '';
-        foreach ($this->demoVoices as $voice) {
-            $voicesHtml .= <<<HTML
-<option value="{$voice['id']}">{$voice['name']} — {$voice['description']}</option>
-HTML;
-        }
+        $duration = $result->duration ?? 0;
+        $previewUri = $result->toDataUri();
 
         return <<<HTML
-<div class="max-w-2xl mx-auto">
-    <div class="mb-8">
-        <h1 class="text-5xl font-semibold tracking-tighter text-white logo-font">Speak now.</h1>
-        <p class="text-zinc-400 mt-3 text-lg">High-quality AI voices at your fingertips. Self-hosted. Secure. Rich SSML support.</p>
-    </div>
-
-    <div class="grid grid-cols-12 gap-8">
-        <!-- Synthesis Form -->
-        <div class="col-span-7 bg-zinc-900 rounded-3xl p-8">
-            <form hx-post="/generate" 
-                  hx-target="#preview-area" 
-                  hx-swap="innerHTML"
-                  class="space-y-8">
-                
-                <div>
-                    <label class="block text-xs font-mono tracking-widest text-zinc-400 mb-2">YOUR TEXT / SSML</label>
-                    
-                    <!-- SSML Toolbar -->
-                    <div class="ssml-toolbar flex flex-wrap gap-2 mb-4 bg-zinc-950 border border-zinc-800 rounded-3xl p-3">
-                        <button onclick="insertSSMLTag('<break time=\"800ms\"/>');return false" 
-                                type="button"
-                                class="text-[10px] px-3 py-1 bg-emerald-950 hover:bg-emerald-900 text-emerald-300 rounded-2xl flex items-center gap-x-1">
-                            <i class="fa-solid fa-pause text-xs"></i>
-                            <span>BREAK</span>
-                        </button>
-                        <button onclick="insertSSMLTag('<prosody rate=\"slow\">', '</prosody>');return false" 
-                                type="button"
-                                class="text-[10px] px-3 py-1 bg-emerald-950 hover:bg-emerald-900 text-emerald-300 rounded-2xl">SLOW</button>
-                        <button onclick="insertSSMLTag('<prosody rate=\"fast\">', '</prosody>');return false" 
-                                type="button"
-                                class="text-[10px] px-3 py-1 bg-emerald-950 hover:bg-emerald-900 text-emerald-300 rounded-2xl">FAST</button>
-                        <button onclick="insertSSMLTag('<prosody pitch=\"+20%\">', '</prosody>');return false" 
-                                type="button"
-                                class="text-[10px] px-3 py-1 bg-emerald-950 hover:bg-emerald-900 text-emerald-300 rounded-2xl">HIGH</button>
-                        <button onclick="insertSSMLTag('<emphasis level=\"strong\">', '</emphasis>');return false" 
-                                type="button"
-                                class="text-[10px] px-3 py-1 bg-emerald-950 hover:bg-emerald-900 text-emerald-300 rounded-2xl">STRONG</button>
-                        <button onclick="insertSSMLTag('<say-as interpret-as=\"spell-out\">', '</say-as>');return false" 
-                                type="button"
-                                class="text-[10px] px-3 py-1 bg-emerald-950 hover:bg-emerald-900 text-emerald-300 rounded-2xl">SPELL</button>
-                        <button onclick="insertSSMLTag('<speak>','</speak>');return false" 
-                                type="button"
-                                class="text-[10px] px-3 py-1 bg-zinc-800 hover:bg-zinc-700 text-zinc-400 rounded-2xl">WRAP SPEAK</button>
-                    </div>
-
-                    <div class="flex gap-2 mb-3">
-                        <button onclick="loadSSMLExample('pause');return false" 
-                                type="button"
-                                class="text-[10px] px-4 py-1 border border-zinc-700 hover:border-emerald-400 rounded-3xl text-zinc-400 hover:text-white">Pause example</button>
-                        <button onclick="loadSSMLExample('prosody');return false" 
-                                type="button"
-                                class="text-[10px] px-4 py-1 border border-zinc-700 hover:border-emerald-400 rounded-3xl text-zinc-400 hover:text-white">Prosody example</button>
-                        <button onclick="loadSSMLExample('emphasis');return false" 
-                                type="button"
-                                class="text-[10px] px-4 py-1 border border-zinc-700 hover:border-emerald-400 rounded-3xl text-zinc-400 hover:text-white">Emphasis example</button>
-                    </div>
-
-                    <textarea id="text-input" name="text" rows="6" required
-                        class="w-full resize-y font-mono bg-zinc-950 border border-zinc-700 focus:border-emerald-500 rounded-3xl px-6 py-5 text-sm placeholder-zinc-500 focus:outline-none transition leading-relaxed"
-                        placeholder="Enter text or SSML here...&#10;e.g. Hello &lt;break time=&quot;1s&quot;/&gt; world."></textarea>
-                </div>
-
-                <div class="grid grid-cols-2 gap-6">
-                    <div>
-                        <label class="block text-xs font-mono tracking-widest text-zinc-400 mb-2">VOICE</label>
-                        <select name="voice_id" 
-                            class="w-full bg-zinc-800 border border-transparent focus-within:border-emerald-500 rounded-3xl px-6 h-14 text-white focus:outline-none appearance-none">
-                            {$voicesHtml}
-                        </select>
-                    </div>
-                    <div>
-                        <label class="block text-xs font-mono tracking-widest text-zinc-400 mb-2">PROVIDER</label>
-                        <div class="bg-zinc-800 border border-transparent h-14 rounded-3xl px-6 flex items-center text-emerald-300">
-                            ElevenLabs <span class="ml-auto text-[10px] bg-emerald-900 text-emerald-400 px-3 rounded-3xl">PRIMARY</span>
-                        </div>
-                    </div>
-                </div>
-
-                <div class="grid grid-cols-2 gap-8">
-                    <div>
-                        <div class="flex justify-between text-xs mb-3">
-                            <span class="font-mono text-zinc-400">STABILITY</span>
-                            <span id="stability-val" class="font-mono text-emerald-400">50</span>
-                        </div>
-                        <input type="range" name="stability" value="50" min="0" max="100"
-                               oninput="updateSlider(this)"
-                               class="w-full accent-emerald-500 bg-zinc-700 rounded-full h-2 outline-none">
-                    </div>
-                    <div>
-                        <div class="flex justify-between text-xs mb-3">
-                            <span class="font-mono text-zinc-400">CLARITY + SIMILARITY</span>
-                            <span id="similarity-val" class="font-mono text-emerald-400">75</span>
-                        </div>
-                        <input type="range" name="similarity" value="75" min="0" max="100"
-                               oninput="updateSlider(this)"
-                               class="w-full accent-emerald-500 bg-zinc-700 rounded-full h-2 outline-none">
-                    </div>
-                </div>
-
-                <button type="submit"
-                        class="w-full h-16 bg-white text-zinc-900 hover:bg-amber-200 active:scale-[0.985] transition-all rounded-3xl text-lg font-semibold flex items-center justify-center gap-x-3 shadow-inner">
-                    <i class="fa-solid fa-waveform-lines"></i>
-                    <span>GENERATE SPEECH</span>
-                </button>
-            </form>
-            
-            <div class="mt-8 pt-6 border-t border-zinc-800 text-[10px] text-zinc-500 flex items-center gap-x-2">
-                <i class="fa-solid fa-info-circle"></i>
-                <span>SSML tags are passed directly to the TTS provider. Live audio preview appears on the right.</span>
-            </div>
-        </div>
-
-        <!-- Preview / Result -->
-        <div class="col-span-5">
-            <div id="preview-area" class="bg-zinc-900 rounded-3xl h-full p-8 flex flex-col">
-                <div class="flex-1 flex flex-col items-center justify-center text-center">
-                    <div class="w-16 h-16 bg-zinc-800 rounded-2xl flex items-center justify-center mb-6">
-                        <i class="fa-solid fa-headphones text-3xl text-zinc-600"></i>
-                    </div>
-                    <p class="text-zinc-400 text-sm max-w-[180px]">Your generated audio (with SSML applied) will appear here with an inline player.</p>
-                </div>
-                
-                <div class="text-[10px] font-mono text-center text-zinc-500 mt-auto pt-8 border-t border-zinc-800">
-                    LIVE PREVIEW • SSML ENABLED
-                </div>
-            </div>
-        </div>
-    </div>
-
-    <!-- Recent generations -->
-    <div class="mt-16">
-        <div class="flex items-baseline justify-between mb-6">
-            <div class="uppercase text-xs tracking-[1px] font-medium text-zinc-400">Recent generations</div>
-            <a href="#" class="text-xs text-emerald-400 hover:text-emerald-300 flex items-center gap-x-1">
-                VIEW ALL <span class="text-lg leading-none">→</span>
-            </a>
-        </div>
-        
-        <div class="grid grid-cols-3 gap-4">
-            <div onclick="this.querySelector('audio').play()" 
-                 class="bg-zinc-900 hover:bg-zinc-800/70 border border-zinc-800 rounded-3xl p-5 cursor-pointer transition group">
-                <div class="text-xs text-zinc-400 line-clamp-1">Hello there. &lt;break time="1s"/&gt; How are you?</div>
-                <div class="mt-8 flex justify-between items-end">
-                    <div>
-                        <div class="text-emerald-300 text-sm">Rachel</div>
-                        <div class="text-[10px] text-zinc-500">12m ago • 0.12$</div>
-                    </div>
-                    <audio src="data:audio/mpeg;base64,/+MYxAAAAANIAAAAAExBTUUzLjk4LjIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" class="hidden"></audio>
-                    <i class="fa-solid fa-play text-xl text-zinc-400 group-active:text-emerald-400 transition"></i>
-                </div>
-            </div>
-            
-            <div onclick="this.querySelector('audio').play()" 
-                 class="bg-zinc-900 hover:bg-zinc-800/70 border border-zinc-800 rounded-3xl p-5 cursor-pointer transition group">
-                <div class="text-xs text-zinc-400 line-clamp-1">&lt;prosody rate="slow"&gt;The future of voice is self-hosted.&lt;/prosody&gt;</div>
-                <div class="mt-8 flex justify-between items-end">
-                    <div>
-                        <div class="text-emerald-300 text-sm">Adam</div>
-                        <div class="text-[10px] text-zinc-500">41m ago • 0.09$</div>
-                    </div>
-                    <audio src="data:audio/mpeg;base64,/+MYxAAAAANIAAAAAExBTUUzLjk4LjIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" class="hidden"></audio>
-                    <i class="fa-solid fa-play text-xl text-zinc-400 group-active:text-emerald-400 transition"></i>
-                </div>
-            </div>
-            
-            <div onclick="this.querySelector('audio').play()" 
-                 class="bg-zinc-900 hover:bg-zinc-800/70 border border-zinc-800 rounded-3xl p-5 cursor-pointer transition group">
-                <div class="text-xs text-zinc-400 line-clamp-1">Welcome to the <emphasis>control plane</emphasis> for AI voices.</div>
-                <div class="mt-8 flex justify-between items-end">
-                    <div>
-                        <div class="text-emerald-300 text-sm">Bella</div>
-                        <div class="text-[10px] text-zinc-500">2h ago • 0.18$</div>
-                    </div>
-                    <audio src="data:audio/mpeg;base64,/+MYxAAAAANIAAAAAExBTUUzLjk4LjIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" class="hidden"></audio>
-                    <i class="fa-solid fa-play text-xl text-zinc-400 group-active:text-emerald-400 transition"></i>
-                </div>
-            </div>
-        </div>
-    </div>
-</div>
-HTML;
-    }
-
-    private function renderLibraryPanel(array $libraryItems = []): string
-    {
-        if (empty($libraryItems)) {
-            $libraryItems = $this->demoVoices;
-        }
-        $voiceCount = count($libraryItems);
-
-        $itemsHtml = '';
-        foreach ($libraryItems as $voice) {
-            $itemsHtml .= <<<HTML
-<div class="bg-zinc-900 border border-zinc-700 rounded-3xl p-6 hover:border-emerald-500 transition group">
-    <div class="flex justify-between">
-        <div>
-            <div class="font-semibold text-xl text-white">{$voice['name']}</div>
-            <div class="text-emerald-300 text-sm">{$voice['description'] ?? ''}</div>
-        </div>
-        <button onclick="window.location='/dashboard?voice={$voice['id']}'" 
-                class="self-start text-xs border border-zinc-700 hover:border-white px-5 h-8 rounded-3xl text-white transition">
-            USE VOICE
-        </button>
-    </div>
-    <div class="h-px bg-zinc-800 my-6"></div>
-    <div class="flex items-center justify-between text-xs">
-        <div class="flex items-center gap-x-4">
-            <div class="px-3 py-1 bg-zinc-800 rounded-3xl">EN</div>
-            <div class="px-3 py-1 bg-zinc-800 rounded-3xl">FEMALE</div>
-        </div>
-        <div class="text-emerald-400 text-xl">♬</div>
-    </div>
-</div>
-HTML;
-        }
-
-        return <<<HTML
-<div>
-    <div class="flex items-center justify-between mb-8">
-        <div>
-            <h1 class="text-4xl font-semibold tracking-tight">Voice Library</h1>
-            <p class="text-zinc-400">Curated high-quality voices • tagged and reusable</p>
-        </div>
-        <button onclick="alert('Voice import coming in v1.1');"
-                class="px-6 h-10 bg-white text-zinc-900 rounded-3xl text-sm font-semibold flex items-center gap-x-2">
-            <i class="fa-solid fa-plus"></i>
-            <span>ADD CUSTOM VOICE</span>
-        </button>
-    </div>
-
-    <div class="grid grid-cols-2 gap-6">
-        {$itemsHtml}
-    </div>
-
-    <div class="mt-12 text-xs uppercase font-mono text-zinc-500 border-t border-zinc-800 pt-6">
-        {$voiceCount} voices stored in SQLite • 
-        Tags and presets will be stored here
-    </div>
-</div>
-HTML;
-    }
-
-    private function renderResultFragment(string $text, string $voiceName, string $dataUri, array $info = []): string
-    {
-        $duration = $info['duration'] ?? '3.4';
-        $meta = $info['metadata'] ?? [];
-        $characterCount = $meta['character_count'] ?? '142';
-
-        $escapedText = htmlspecialchars($text);
-
-        return <<<HTML
-<div class="rounded-3xl bg-gradient-to-br from-zinc-800 to-zinc-900 border border-emerald-900 p-7 shadow-2xl">
-    <div class="flex items-center gap-x-4 mb-6">
-        <div class="rounded-2xl bg-emerald-900 w-9 h-9 flex items-center justify-center flex-shrink-0">
-            <i class="fa-solid fa-check text-emerald-400"></i>
-        </div>
-        <div class="flex-1 min-w-0">
-            <div class="font-medium text-white text-lg leading-none">Generation successful</div>
-            <div class="text-emerald-400 text-sm mt-1">{$voiceName} • SSML applied</div>
-        </div>
-        <div onclick="copyText(`{$escapedText}`)" 
-             class="cursor-pointer text-xs bg-zinc-800 hover:bg-zinc-700 transition px-4 py-2 rounded-3xl flex items-center gap-x-2">
-            <i class="fa-solid fa-copy"></i>
-            <span>COPY</span>
-        </div>
-    </div>
-
-    <audio controls class="w-full mb-8 accent-emerald-500">
-        <source src="{$dataUri}" type="audio/mpeg">
-        Your browser does not support the audio element.
+<div class="rounded-3xl bg-gradient-to-br from-violet-500/10 to-fuchsia-500/10 border border-violet-500/30 p-6">
+    <audio controls class="w-full mb-6">
+        <source src="{$url}" type="audio/mpeg">
     </audio>
-
-    <div class="flex items-center gap-3">
-        <button onclick="downloadAudio('{$dataUri}', 'voxora-{$voiceName}-' + Date.now() + '.mp3')" 
-                class="flex-1 flex items-center justify-center gap-x-3 bg-white text-zinc-950 h-14 rounded-3xl font-semibold hover:shadow-xl transition-all active:scale-95">
-            <i class="fa-solid fa-download"></i>
-            <span>DOWNLOAD MP3</span>
-        </button>
-        
-        <button onclick="this.closest('.bg-gradient-to-br').remove()" 
-                class="h-14 w-14 border border-zinc-700 hover:border-zinc-400 rounded-3xl transition flex items-center justify-center">
-            ✕
-        </button>
-    </div>
-
-    <div class="mt-8 pt-6 border-t border-zinc-700 grid grid-cols-3 gap-3 text-center text-[10px]">
-        <div class="bg-black/30 rounded-2xl py-3">
+    <a href="{$url}" download class="inline-flex items-center gap-2 bg-white text-zinc-900 px-6 py-3 rounded-2xl text-sm font-semibold hover:shadow">
+        ⬇ Download MP3
+    </a>
+    <div class="mt-8 grid grid-cols-2 gap-6 text-xs">
+        <div>
             <div class="text-zinc-400">DURATION</div>
-            <div class="font-mono text-lg text-white">{$duration}s</div>
+            <div class="text-4xl font-mono text-white">{$duration}s</div>
         </div>
-        <div class="bg-black/30 rounded-2xl py-3">
-            <div class="text-zinc-400">TOKENS</div>
-            <div class="font-mono text-lg text-white">{$characterCount}</div>
+        <div>
+            <div class="text-zinc-400">VOICE</div>
+            <div class="font-medium">{$voiceId}</div>
         </div>
-        <div class="bg-black/30 rounded-2xl py-3">
-            <div class="text-zinc-400">COST</div>
-            <div class="font-mono text-lg text-emerald-400">\$0.018</div>
-        </div>
+    </div>
+    <div class="mt-6 pt-6 border-t border-white/10 text-xs text-zinc-400">
+        {$text}
+    </div>
+    <div class="mt-4">
+        <a href="#" onclick="this.innerHTML='Added to library!'; return false;" 
+           class="text-violet-400 hover:text-violet-300 text-xs">+ Save to Voice Library</a>
     </div>
 </div>
 HTML;
     }
 
-    private function getVoiceName(string $voiceId): string
+    private function renderLibraryPage(array $voices, array $user): string
     {
-        foreach ($this->demoVoices as $voice) {
-            if ($voice['id'] === $voiceId) {
-                return $voice['name'];
-            }
+        $html = '<!DOCTYPE html><html><head><meta charset="UTF-8"><script src="https://cdn.tailwindcss.com"></script></head><body class="bg-zinc-950 text-zinc-200 p-8">';
+        $html .= '<h1 class="text-3xl font-semibold mb-8">Voice Library</h1>';
+        $html .= '<div class="bg-zinc-900 rounded-3xl p-8">';
+        $html .= '<form action="/api/v1/clone-voice" method="post" enctype="multipart/form-data" class="mb-12 border border-dashed border-zinc-700 rounded-3xl p-8">';
+        $html .= '<input type="hidden" name="token" value="demo-token-for-ui">';
+        $html .= '<div class="text-sm mb-2">Clone New Voice</div>';
+        $html .= '<input type="text" name="name" placeholder="Voice name" class="block w-full mb-4 bg-zinc-800 border-0 p-4 rounded-2xl">';
+        $html .= '<input type="file" name="sample" accept="audio/*" class="block w-full mb-6 text-sm">';
+        $html .= '<button type="submit" class="bg-amber-500 text-black px-8 py-3.5 rounded-2xl text-sm font-medium">UPLOAD SAMPLE &amp; CLONE</button>';
+        $html .= '</form>';
+        $html .= '<div class="grid grid-cols-2 gap-4">';
+        foreach ($voices as $v) {
+            $isCloned = !empty($v['is_cloned']) ? '<span class="ml-2 text-[10px] bg-amber-400 text-black px-2 py-px rounded">CLONED</span>' : '';
+            $html .= '<div class="bg-zinc-800 p-5 rounded-2xl">';
+            $html .= '<div class="font-medium">' . htmlspecialchars($v['name'] ?? ($v['id'] ?? 'Voice')) . $isCloned . '</div>';
+            $html .= '<div class="text-xs text-zinc-500 mt-1">' . htmlspecialchars($v['id'] ?? '') . '</div>';
+            $html .= '</div>';
         }
-        return 'Voice';
+        $html .= '</div></div>';
+        $html .= '</body></html>';
+        return $html;
     }
 }
