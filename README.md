@@ -29,6 +29,7 @@ Developers integrating high-quality voices face fragmented provider APIs, expose
 - **Instant UI + REST** — Responsive HTMX/Tailwind dashboard and a token-protected JSON API let you preview, download or embed speech from any app.
 - **Local fallback** — Seamless offline synthesis via Piper when cloud providers are unavailable.
 - **Voice cloning** — Upload audio samples directly to provider APIs (`Manager::cloneVoice()`) with results persisted as reusable custom voices.
+- **Audio post-processing** — FFmpeg integration for loudness normalization (EBU R128 loudnorm), peak limiting, format conversion (MP3/WAV) and duration measurement.
 
 ## 🎬 Demo
 
@@ -85,6 +86,12 @@ Piper fallback via Symfony Process — fully offline synthesis on cloud failure
 Upload sample audio via <code>/api/v1/clone-voice</code> or Library UI; <code>Manager::cloneVoice()</code> calls provider APIs (ElevenLabs /v1/voices/add), persists voice_id in SQLite for immediate reuse
 </td>
 </tr>
+<tr>
+<td valign="top" colspan="3">
+🎚️ <b>Audio Processor</b><br>
+FFmpeg integration for normalization, loudness (loudnorm filter targeting LUFS), format conversion (MP3/WAV) and automatic duration extraction — available on every <code>SynthesisResult</code>
+</td>
+</tr>
 </table>
 
 ## 📦 Installation
@@ -94,6 +101,7 @@ Upload sample audio via <code>/api/v1/clone-voice</code> or Library UI; <code>Ma
 - PHP 8.2+ with `ext-sqlite3`, `ext-sodium`, `ext-json`
 - Composer
 - (Optional) Piper binary + voice model for local fallback
+- (Optional) FFmpeg CLI for normalization & format conversion
 
 ```bash
 composer create-project ajendras/voxora voxora-app
@@ -133,6 +141,8 @@ Voxora automatically falls back to fully offline TTS using the Piper engine (via
 
 The `TTS\Manager::generate()` call will transparently fallback. WAV output is returned for local generations. Explicit usage: `provider: 'piper'`.
 
+**FFmpeg post-processing** (new): All results can be normalized and/or converted via `$result->process(['normalize' => true, 'target_loudness' => -16, 'format' => 'mp3'])`. FFmpeg must be installed and available in `$PATH` (or configure absolute path). Loudness uses the industry-standard `loudnorm` filter.
+
 ## ⚡ Quick start
 
 ```php
@@ -155,15 +165,20 @@ $voiceId = $manager->cloneVoice(
 );
 echo "Cloned voice ready: $voiceId\n";
 
-// Standard synthesis with cloned voice
+// Standard synthesis with cloned voice + post-processing
 $result = $manager->generate(
     text: "Hello from your cloned voice.",
     voiceId: $voiceId,
-    provider: "elevenlabs"
+    provider: "elevenlabs",
+    options: [
+        'normalize' => true,
+        'target_loudness' => -16.0,
+        'format' => 'mp3'
+    ]
 );
 
 $result->save('output/cloned.mp3');
-echo "Saved! Duration: " . ($result->duration ?? 'unknown') . "s\n";
+echo "Saved! Duration: " . ($result->duration ?? 'unknown') . "s (normalized)\n";
 ```
 
 ## 🧰 Usage
@@ -179,7 +194,7 @@ After login the top bar reflects the current user and role. Admins see additiona
 
 ### Dashboard synthesis (HTMX)
 
-Visit `/dashboard` (after login), fill the form and click **GENERATE SPEECH**. The `DashboardController::generateAction()` returns a live audio fragment with player, download button and metadata. Stats and history are scoped to the logged-in user.
+Visit `/dashboard` (after login), fill the form and click **GENERATE SPEECH**. The `DashboardController::generateAction()` returns a live audio fragment with player, download button and metadata. Stats and history are scoped to the logged-in user. New controls for normalization and output format are included.
 
 ### Rich SSML Editor
 
@@ -197,7 +212,7 @@ Hello <break time="800ms"/> my name is <prosody rate="slow" pitch="-5%">Voxora</
 <emphasis level="strong">This is important.</emphasis>
 ```
 
-The generated audio respects all prosody, pauses and emphasis.
+The generated audio respects all prosody, pauses and emphasis. Post-processing (normalization/format) is applied automatically.
 
 ### Voice cloning workflow
 
@@ -239,6 +254,8 @@ Use the token in the `Authorization: Bearer` header or `X-Api-Key` for `/api/v1/
 
 ### Batch processing from CSV
 
+CSV columns (case-insensitive): text, voice_id (or voice), provider, filename, format (mp3/wav), normalize (true/false).
+
 ```php
 use Voxora\Automation\BatchGenerator;
 
@@ -270,10 +287,10 @@ if ($report->failed > 0) {
 ```bash
 curl -X POST http://localhost:8080/api/v1/speech \
   -H "X-Api-Key: vxo_..." \
-  -d 'text=Welcome to the control plane.&voice_id=21m00Tcm4TlvDq8ikWAM'
+  -d 'text=Welcome to the control plane.&voice_id=21m00Tcm4TlvDq8ikWAM&normalize=1&format=mp3&target_loudness=-16'
 ```
 
-Provider can be set to `piper` for local synthesis. Use `/api/v1/clone-voice` for cloning. SSML inside the `text` field is passed through to the provider.
+Provider can be set to `piper` for local synthesis. Use `/api/v1/clone-voice` for cloning. SSML inside the `text` field is passed through to the provider. New fields control FFmpeg processing.
 
 ## 🔧 Configuration
 
@@ -288,6 +305,9 @@ Provider can be set to `piper` for local synthesis. Use `/api/v1/clone-voice` fo
 | `providers.piper.model`       | (required for fallback) | Path to Piper .onnx voice model file |
 | `audio.directory`             | `storage/audio`       | Directory where `ApiController::speechAction()` saves generated MP3s |
 | `audio.public_url_prefix`     | `/audio`              | Public URL prefix returned in JSON responses |
+| `ffmpeg.binary`               | `ffmpeg`              | Path to FFmpeg binary (used by SynthesisResult::process()) |
+| `ffmpeg.normalize`            | true                  | Whether to run loudnorm filter by default |
+| `ffmpeg.target_loudness`      | -16.0                 | Target LUFS value for normalization |
 
 All values are defined in `config/app.php` and loaded by `Kernel`.
 
@@ -308,16 +328,17 @@ flowchart TD
     Provider --> ElevenLabs[ElevenLabsProvider<br>(/voices/add for cloning)]
     Provider --> Piper[PiperProvider<br>(throws on clone)]
     Manager --> Fallback[Fallback to Piper on cloud error]
+    Manager --> PostProcess[SynthesisResult::process()<br>FFmpeg loudnorm + conversion]
     Manager --> Repo[SqliteRepository<br>(users, generations, voices with is_cloned)]
     Upload[Sample Upload] --> Api
     Api --> Manager
     Manager --> Repo[saveCustomVoice]
     Batch[BatchGenerator::run] --> Manager
-    Manager --> Synthesis[SynthesisResult<br>(save, toDataUri)]
+    Manager --> Synthesis[SynthesisResult<br>(save, toDataUri, process)]
     Users[(users table<br>role-based)]
 ```
 
-`Kernel` wires together `KeyManager`, `TTS\Manager`, `SqliteRepository` and the two controllers. All synthesis paths converge on `Manager::generate()`, which selects a `ProviderInterface` implementation, caches results and records usage. The dashboard uses HTMX fragments while the API returns JSON with public audio URLs. Sessions + `users` table enable multi-user isolation and role checks (`admin` vs `user`). Piper is used as automatic fallback for offline/resilient operation. Voice cloning is handled by `Manager::cloneVoice()` which delegates to the provider, stores the voice, and makes it available in `listLibrary()`. The new SSML editor lives inside `DashboardController::renderSynthPanel()` with pure-JS tag insertion that feeds directly into the existing HTMX generation flow.
+`Kernel` wires together `KeyManager`, `TTS\Manager`, `SqliteRepository` and the two controllers. All synthesis paths converge on `Manager::generate()`, which selects a `ProviderInterface` implementation, caches results and records usage. The dashboard uses HTMX fragments while the API returns JSON with public audio URLs. Sessions + `users` table enable multi-user isolation and role checks (`admin` vs `user`). Piper is used as automatic fallback for offline/resilient operation. Voice cloning is handled by `Manager::cloneVoice()` which delegates to the provider, stores the voice, and makes it available in `listLibrary()`. The new SSML editor lives inside `DashboardController::renderSynthPanel()` with pure-JS tag insertion that feeds directly into the existing HTMX generation flow. **FFmpeg integration lives in `SynthesisResult::process()`** and is invoked automatically by `Manager`.
 
 ## 📁 Project structure
 
@@ -335,7 +356,7 @@ flowchart TD
 │   │   ├── ProviderInterface.php # synthesize() + cloneVoice()
 │   │   ├── ElevenLabsProvider.php # implements cloning via /v1/voices/add
 │   │   ├── PiperProvider.php     # local synthesis via Symfony Process + WAV output (throws on clone)
-│   │   ├── SynthesisResult.php   # common result value object (mp3/wav)
+│   │   ├── SynthesisResult.php   # common result value object (mp3/wav) with FFmpeg process()
 │   │   └── Manager.php           # generate() with caching, usage recording & Piper fallback; cloneVoice()
 │   ├── Http/
 │   │   ├── DashboardController.php # HTMX pages + generateAction + login/logout + rich SSML editor
@@ -360,7 +381,7 @@ composer test
 vendor/bin/phpunit
 ```
 
-The test suite covers `KeyManager` token issuance, validation, expiry checks, encryption round-trips, scope enforcement and the new role/userId fields. New unit tests validate Piper WAV duration parsing and fallback paths. `PiperProviderTest` now also asserts that `cloneVoice()` throws the expected exception.
+The test suite covers `KeyManager` token issuance, validation, expiry checks, encryption round-trips, scope enforcement and the new role/userId fields. New unit tests validate Piper WAV duration parsing and fallback paths. `PiperProviderTest` now also asserts that `cloneVoice()` throws the expected exception and that `SynthesisResult::process()` correctly handles normalization and format conversion (with graceful degradation when FFmpeg is unavailable).
 
 ## 📍 Roadmap
 
@@ -370,7 +391,7 @@ The test suite covers `KeyManager` token issuance, validation, expiry checks, en
 - [x] Local TTS fallback via Piper using Symfony Process component
 - [x] Voice cloning workflow with sample upload to provider APIs
 - [x] Rich SSML editor with live preview inside dashboard
-- [ ] FFmpeg integration for normalization, loudness and format conversion
+- [x] FFmpeg integration for normalization, loudness and format conversion
 - [ ] Interactive usage analytics dashboard with Chart.js charts
 - [ ] Configurable webhooks on successful generation
 - [ ] Redis-backed rate limiter and request throttling

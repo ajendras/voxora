@@ -68,13 +68,21 @@ final class ApiController
         }
 
         try {
+            $options = [
+                'normalize' => ($input['normalize'] ?? 'true') !== 'false',
+                'target_loudness' => (float) ($input['target_loudness'] ?? -16.0),
+                'format' => strtolower($input['format'] ?? 'mp3'),
+            ];
+
             $result = $this->ttsManager->generate(
                 $text,
                 $voiceId,
-                $input['provider'] ?? null
+                $input['provider'] ?? null,
+                $options
             );
 
-            $filename = 'vox-' . bin2hex(random_bytes(10)) . '.mp3';
+            $ext = $result->format === 'wav' ? 'wav' : 'mp3';
+            $filename = 'vox-' . bin2hex(random_bytes(10)) . '.' . $ext;
             $audioDir = $this->config['audio']['directory'] ?? __DIR__ . '/../../storage/audio';
             $audioPath = $audioDir . '/' . $filename;
             $result->save($audioPath);
@@ -105,6 +113,8 @@ final class ApiController
                 'text_preview' => substr($text, 0, 80) . (strlen($text) > 80 ? '...' : ''),
                 'user_id' => $token->userId,
                 'role' => $token->role,
+                'normalized' => $result->metadata['normalized'] ?? false,
+                'format' => $result->format,
             ]);
         } catch (InvalidArgumentException $e) {
             return Response::json(['error' => $e->getMessage()], 400);
@@ -301,6 +311,9 @@ final class ApiController
             'name' => $request->getPost('name', ''),
             'scopes' => $request->getPost('scopes', ''),
             'role' => $request->getPost('role', ''),
+            'normalize' => $request->getPost('normalize', 'true'),
+            'format' => $request->getPost('format', 'mp3'),
+            'target_loudness' => $request->getPost('target_loudness', '-16'),
         ];
     }
 

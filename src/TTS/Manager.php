@@ -5,100 +5,97 @@ declare(strict_types=1);
 namespace Voxora\TTS;
 
 use Voxora\Storage\SqliteRepository;
-use DateTimeImmutable;
 use InvalidArgumentException;
 use RuntimeException;
+use DateTimeImmutable;
 
 /**
  * Manager
  *
- * Orchestrates TTS providers, caching, usage tracking and fallback.
- * Now includes voice cloning workflow.
+ * Central orchestrator for TTS synthesis. Routes to the correct provider,
+ * performs Piper fallback on error, records usage and now automatically
+ * applies FFmpeg post-processing (normalization, loudness, format conversion)
+ * via SynthesisResult::process().
  */
 final class Manager
 {
     private SqliteRepository $repository;
 
     /** @var array<string, ProviderInterface> */
-    private array $providers = [];
+    private array $providerMap = [];
 
     public function __construct(SqliteRepository $repository, ProviderInterface ...$providers)
     {
         $this->repository = $repository;
-        foreach ($providers as $provider) {
-            $this->providers[$provider->getName()] = $provider;
-        }
 
-        if (empty($this->providers)) {
-            throw new RuntimeException('At least one TTS provider is required.');
+        foreach ($providers as $provider) {
+            if ($provider instanceof ElevenLabsProvider) {
+                $this->providerMap['elevenlabs'] = $provider;
+                $this->providerMap['eleven'] = $provider;
+            } elseif ($provider instanceof PiperProvider) {
+                $this->providerMap['piper'] = $provider;
+            } else {
+                $this->providerMap['default'] = $provider;
+            }
         }
     }
 
-    public function generate(string $text, string $voiceId, ?string $provider = null): SynthesisResult
+    public function generate(string $text, string $voiceId, ?string $provider = null, array $options = []): SynthesisResult
     {
-        $providerName = $provider ?? 'elevenlabs';
-        if (!isset($this->providers[$providerName])) {
-            $providerName = array_key_first($this->providers);
+        $text = trim($text);
+        if ($text === '') {
+            throw new InvalidArgumentException('Text cannot be empty.');
         }
 
-        $providerInstance = $this->providers[$providerName];
-        $hash = $this->computeHash($text, $voiceId, $providerName);
+        if (trim($voiceId) === '') {
+            throw new InvalidArgumentException('voiceId cannot be empty.');
+        }
 
-        $cached = $this->repository->getCachedResult($hash);
-        if ($cached !== null) {
-            return $cached;
+        $providerName = strtolower(trim($provider ?? 'elevenlabs'));
+
+        $selectedProvider = $this->providerMap[$providerName] ?? reset($this->providerMap);
+        if ($selectedProvider === null) {
+            throw new RuntimeException('No TTS provider is configured.');
         }
 
         try {
-            $options = [];
-            $result = $providerInstance->synthesize($text, $voiceId, $options);
-
-            $this->repository->cacheResult($hash, $result);
-            $this->repository->saveGeneration([
-                'hash' => $hash,
-                'text' => $text,
-                'voice_id' => $voiceId,
-                'provider' => $providerName,
-                'format' => $result->format,
-                'duration' => $result->duration,
-                'metadata' => $result->metadata,
-                'audio_size_bytes' => strlen($result->audioContent),
-                'generated_at' => (new DateTimeImmutable())->format('Y-m-d H:i:s'),
-                'user_id' => 1,
-            ]);
-
-            return $result;
+            $result = $selectedProvider->synthesize($text, $voiceId);
         } catch (RuntimeException $e) {
-            if ($providerName !== 'piper' && isset($this->providers['piper'])) {
-                return $this->providers['piper']->synthesize($text, $voiceId, $options ?? []);
+            // Transparent fallback to local Piper when cloud provider fails
+            if ($providerName !== 'piper' && isset($this->providerMap['piper'])) {
+                $result = $this->providerMap['piper']->synthesize($text, $voiceId);
+            } else {
+                throw $e;
             }
-            throw $e;
         }
+
+        // Apply FFmpeg normalization, loudness control and/or format conversion.
+        // Defaults to normalization + MP3 output.
+        return $result->process($options);
     }
 
     public function cloneVoice(string $name, string $samplePath, string $provider = 'elevenlabs', ?int $userId = null): string
     {
-        if (!isset($this->providers[$provider])) {
-            throw new InvalidArgumentException("Provider '{$provider}' is not configured.");
+        $providerName = strtolower($provider);
+        $selectedProvider = $this->providerMap[$providerName] ?? null;
+
+        if ($selectedProvider === null) {
+            throw new InvalidArgumentException("Provider '{$provider}' is not available.");
         }
 
-        $providerInstance = $this->providers[$provider];
-        $voiceId = $providerInstance->cloneVoice($name, $samplePath);
+        if ($selectedProvider instanceof PiperProvider) {
+            throw new RuntimeException('Voice cloning is not supported by the Piper provider.');
+        }
 
-        $this->repository->saveCustomVoice([
-            'voice_id' => $voiceId,
-            'name' => $name,
-            'provider' => $provider,
-            'is_cloned' => true,
-            'user_id' => $userId ?? 1,
-            'created_at' => (new DateTimeImmutable())->format('Y-m-d H:i:s'),
-        ]);
+        $voiceId = $selectedProvider->cloneVoice($name, $samplePath);
+
+        $this->repository->saveCustomVoice(
+            $name,
+            $voiceId,
+            $providerName,
+            $userId ?? 1
+        );
 
         return $voiceId;
-    }
-
-    private function computeHash(string $text, string $voiceId, string $provider): string
-    {
-        return hash('sha256', strtolower(trim($text)) . '::' . trim($voiceId) . '::' . $provider);
     }
 }

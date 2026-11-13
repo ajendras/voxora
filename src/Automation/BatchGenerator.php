@@ -15,6 +15,8 @@ use DateTimeImmutable;
  * Processes CSV files containing synthesis instructions, calls the TTS Manager
  * for each row, writes MP3 files to an output directory and returns a Report.
  * Supports a progress callback for CLI or UI feedback.
+ *
+ * CSV may now contain "format" (mp3/wav) and "normalize" (true/false) columns.
  */
 final class BatchGenerator
 {
@@ -45,7 +47,8 @@ final class BatchGenerator
     /**
      * Execute batch from a CSV file.
      *
-     * CSV columns (case-insensitive): text, voice_id (or voice), provider, filename (optional)
+     * CSV columns (case-insensitive): text, voice_id (or voice), provider, filename (optional),
+     * format (mp3/wav), normalize (true/false)
      *
      * @param string $csvPath Absolute or relative path to CSV
      * @param callable|null $progress Optional callback: fn(int $current, int $total, string $message, ?string $filePath): void
@@ -90,12 +93,26 @@ final class BatchGenerator
                 continue;
             }
 
-            try {
-                $result = $this->manager->generate($text, $voiceId, $provider);
+            $options = [
+                'normalize' => true,
+                'target_loudness' => -16.0,
+                'format' => 'mp3',
+            ];
 
+            if (isset($row['format'])) {
+                $options['format'] = strtolower(trim($row['format']));
+            }
+            if (isset($row['normalize'])) {
+                $options['normalize'] = filter_var($row['normalize'], FILTER_VALIDATE_BOOLEAN);
+            }
+
+            try {
+                $result = $this->manager->generate($text, $voiceId, $provider, $options);
+
+                $ext = $options['format'] === 'wav' ? 'wav' : 'mp3';
                 $filename = $suggestedName !== ''
-                    ? preg_replace('/[^A-Za-z0-9_.-]/', '_', $suggestedName) . '.mp3'
-                    : 'batch_' . str_pad((string) $current, 4, '0', STR_PAD_LEFT) . '.mp3';
+                    ? preg_replace('/[^A-Za-z0-9_.-]/', '_', $suggestedName) . '.' . $ext
+                    : 'batch_' . str_pad((string) $current, 4, '0', STR_PAD_LEFT) . '.' . $ext;
 
                 $filepath = rtrim($this->outputDir, '/\\') . '/' . $filename;
                 $result->save($filepath);
@@ -201,7 +218,7 @@ final class Report
         $successRate = $this->total > 0 ? round(($this->successful / $this->total) * 100, 1) : 0.0;
 
         return sprintf(
-            'Batch completed in %.2fs. %d/%d successful (%.1f%%). %d MP3 files written (%.1fs total audio).',
+            'Batch completed in %.2fs. %d/%d successful (%.1f%%). %d files written (%.1fs total audio).',
             $this->processingTime,
             $this->successful,
             $this->total,
