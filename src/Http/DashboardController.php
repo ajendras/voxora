@@ -246,6 +246,13 @@ HTML;
         .audio-wave {
             animation: waveform 1.2s infinite ease-in-out;
         }
+        .ssml-toolbar button {
+            transition: all 0.1s cubic-bezier(0.4, 0, 0.2, 1);
+        }
+        .ssml-toolbar button:hover {
+            transform: translateY(-1px);
+            box-shadow: 0 4px 6px -1px rgb(16 185 129);
+        }
     </style>
 </head>
 <body class="tail-container bg-zinc-950 text-zinc-200">
@@ -361,6 +368,60 @@ HTML;
             document.documentElement.classList.toggle('dark');
         }
 
+        function insertSSMLTag(openTag, closeTag = '') {
+            const textarea = document.getElementById('text-input');
+            if (!textarea) return;
+
+            const start = textarea.selectionStart;
+            const end = textarea.selectionEnd;
+            const text = textarea.value;
+            let selectedText = text.substring(start, end);
+            let replacement;
+
+            if (closeTag !== '') {
+                replacement = openTag + selectedText + closeTag;
+            } else {
+                replacement = openTag;
+            }
+
+            textarea.value = text.substring(0, start) + replacement + text.substring(end);
+
+            let newCursorPos;
+            if (closeTag !== '' && selectedText === '') {
+                newCursorPos = start + openTag.length;
+            } else if (closeTag !== '') {
+                newCursorPos = start + openTag.length + selectedText.length + closeTag.length;
+            } else {
+                newCursorPos = start + openTag.length;
+            }
+
+            textarea.focus();
+            textarea.setSelectionRange(newCursorPos, newCursorPos);
+        }
+
+        function loadSSMLExample(example) {
+            const textarea = document.getElementById('text-input');
+            if (!textarea) return;
+            let sample = '';
+            switch (example) {
+                case 'pause':
+                    sample = 'Hello there. \\n<break time="1.2s"/> \\nHow are you today?';
+                    break;
+                case 'prosody':
+                    sample = 'The quick brown fox. \\n<prosody rate="slow" pitch="-10%">jumps over the lazy dog.</prosody>';
+                    break;
+                case 'emphasis':
+                    sample = 'This is a normal sentence with <emphasis level="strong">very important</emphasis> information.';
+                    break;
+                case 'spell':
+                    sample = 'The password is <say-as interpret-as="spell-out">abc123</say-as>.';
+                    break;
+                default:
+                    sample = 'Hello from the rich SSML editor.';
+            }
+            textarea.value = sample;
+        }
+
         // Initialize
         window.onload = function() {
             initializeTailwind();
@@ -373,6 +434,8 @@ HTML;
         window.copyText = copyText;
         window.updateSlider = updateSlider;
         window.toggleDarkMode = toggleDarkMode;
+        window.insertSSMLTag = insertSSMLTag;
+        window.loadSSMLExample = loadSSMLExample;
     </script>
 </body>
 </html>
@@ -470,7 +533,7 @@ HTML;
 <div class="max-w-2xl mx-auto">
     <div class="mb-8">
         <h1 class="text-5xl font-semibold tracking-tighter text-white logo-font">Speak now.</h1>
-        <p class="text-zinc-400 mt-3 text-lg">High-quality AI voices at your fingertips. Self-hosted. Secure.</p>
+        <p class="text-zinc-400 mt-3 text-lg">High-quality AI voices at your fingertips. Self-hosted. Secure. Rich SSML support.</p>
     </div>
 
     <div class="grid grid-cols-12 gap-8">
@@ -482,10 +545,51 @@ HTML;
                   class="space-y-8">
                 
                 <div>
-                    <label class="block text-xs font-mono tracking-widest text-zinc-400 mb-2">YOUR TEXT</label>
-                    <textarea name="text" rows="5" required
-                        class="w-full resize-none bg-zinc-800 border border-transparent focus:border-emerald-500 rounded-3xl px-6 py-5 text-lg placeholder-zinc-500 focus:outline-none transition"
-                        placeholder="Hello, this is a demonstration of Voxora..."></textarea>
+                    <label class="block text-xs font-mono tracking-widest text-zinc-400 mb-2">YOUR TEXT / SSML</label>
+                    
+                    <!-- SSML Toolbar -->
+                    <div class="ssml-toolbar flex flex-wrap gap-2 mb-4 bg-zinc-950 border border-zinc-800 rounded-3xl p-3">
+                        <button onclick="insertSSMLTag('<break time=\"800ms\"/>');return false" 
+                                type="button"
+                                class="text-[10px] px-3 py-1 bg-emerald-950 hover:bg-emerald-900 text-emerald-300 rounded-2xl flex items-center gap-x-1">
+                            <i class="fa-solid fa-pause text-xs"></i>
+                            <span>BREAK</span>
+                        </button>
+                        <button onclick="insertSSMLTag('<prosody rate=\"slow\">', '</prosody>');return false" 
+                                type="button"
+                                class="text-[10px] px-3 py-1 bg-emerald-950 hover:bg-emerald-900 text-emerald-300 rounded-2xl">SLOW</button>
+                        <button onclick="insertSSMLTag('<prosody rate=\"fast\">', '</prosody>');return false" 
+                                type="button"
+                                class="text-[10px] px-3 py-1 bg-emerald-950 hover:bg-emerald-900 text-emerald-300 rounded-2xl">FAST</button>
+                        <button onclick="insertSSMLTag('<prosody pitch=\"+20%\">', '</prosody>');return false" 
+                                type="button"
+                                class="text-[10px] px-3 py-1 bg-emerald-950 hover:bg-emerald-900 text-emerald-300 rounded-2xl">HIGH</button>
+                        <button onclick="insertSSMLTag('<emphasis level=\"strong\">', '</emphasis>');return false" 
+                                type="button"
+                                class="text-[10px] px-3 py-1 bg-emerald-950 hover:bg-emerald-900 text-emerald-300 rounded-2xl">STRONG</button>
+                        <button onclick="insertSSMLTag('<say-as interpret-as=\"spell-out\">', '</say-as>');return false" 
+                                type="button"
+                                class="text-[10px] px-3 py-1 bg-emerald-950 hover:bg-emerald-900 text-emerald-300 rounded-2xl">SPELL</button>
+                        <button onclick="insertSSMLTag('<speak>','</speak>');return false" 
+                                type="button"
+                                class="text-[10px] px-3 py-1 bg-zinc-800 hover:bg-zinc-700 text-zinc-400 rounded-2xl">WRAP SPEAK</button>
+                    </div>
+
+                    <div class="flex gap-2 mb-3">
+                        <button onclick="loadSSMLExample('pause');return false" 
+                                type="button"
+                                class="text-[10px] px-4 py-1 border border-zinc-700 hover:border-emerald-400 rounded-3xl text-zinc-400 hover:text-white">Pause example</button>
+                        <button onclick="loadSSMLExample('prosody');return false" 
+                                type="button"
+                                class="text-[10px] px-4 py-1 border border-zinc-700 hover:border-emerald-400 rounded-3xl text-zinc-400 hover:text-white">Prosody example</button>
+                        <button onclick="loadSSMLExample('emphasis');return false" 
+                                type="button"
+                                class="text-[10px] px-4 py-1 border border-zinc-700 hover:border-emerald-400 rounded-3xl text-zinc-400 hover:text-white">Emphasis example</button>
+                    </div>
+
+                    <textarea id="text-input" name="text" rows="6" required
+                        class="w-full resize-y font-mono bg-zinc-950 border border-zinc-700 focus:border-emerald-500 rounded-3xl px-6 py-5 text-sm placeholder-zinc-500 focus:outline-none transition leading-relaxed"
+                        placeholder="Enter text or SSML here...&#10;e.g. Hello &lt;break time=&quot;1s&quot;/&gt; world."></textarea>
                 </div>
 
                 <div class="grid grid-cols-2 gap-6">
@@ -531,6 +635,11 @@ HTML;
                     <span>GENERATE SPEECH</span>
                 </button>
             </form>
+            
+            <div class="mt-8 pt-6 border-t border-zinc-800 text-[10px] text-zinc-500 flex items-center gap-x-2">
+                <i class="fa-solid fa-info-circle"></i>
+                <span>SSML tags are passed directly to the TTS provider. Live audio preview appears on the right.</span>
+            </div>
         </div>
 
         <!-- Preview / Result -->
@@ -540,11 +649,11 @@ HTML;
                     <div class="w-16 h-16 bg-zinc-800 rounded-2xl flex items-center justify-center mb-6">
                         <i class="fa-solid fa-headphones text-3xl text-zinc-600"></i>
                     </div>
-                    <p class="text-zinc-400 text-sm max-w-[180px]">Your generated audio will appear here with an inline player.</p>
+                    <p class="text-zinc-400 text-sm max-w-[180px]">Your generated audio (with SSML applied) will appear here with an inline player.</p>
                 </div>
                 
                 <div class="text-[10px] font-mono text-center text-zinc-500 mt-auto pt-8 border-t border-zinc-800">
-                    LIVE PREVIEW • DATA URI ENABLED
+                    LIVE PREVIEW • SSML ENABLED
                 </div>
             </div>
         </div>
@@ -562,7 +671,7 @@ HTML;
         <div class="grid grid-cols-3 gap-4">
             <div onclick="this.querySelector('audio').play()" 
                  class="bg-zinc-900 hover:bg-zinc-800/70 border border-zinc-800 rounded-3xl p-5 cursor-pointer transition group">
-                <div class="text-xs text-zinc-400 line-clamp-1">Thank you for choosing Voxora as your self-hosted TTS solution.</div>
+                <div class="text-xs text-zinc-400 line-clamp-1">Hello there. &lt;break time="1s"/&gt; How are you?</div>
                 <div class="mt-8 flex justify-between items-end">
                     <div>
                         <div class="text-emerald-300 text-sm">Rachel</div>
@@ -575,7 +684,7 @@ HTML;
             
             <div onclick="this.querySelector('audio').play()" 
                  class="bg-zinc-900 hover:bg-zinc-800/70 border border-zinc-800 rounded-3xl p-5 cursor-pointer transition group">
-                <div class="text-xs text-zinc-400 line-clamp-1">The future of voice technology is open source and private.</div>
+                <div class="text-xs text-zinc-400 line-clamp-1">&lt;prosody rate="slow"&gt;The future of voice is self-hosted.&lt;/prosody&gt;</div>
                 <div class="mt-8 flex justify-between items-end">
                     <div>
                         <div class="text-emerald-300 text-sm">Adam</div>
@@ -588,7 +697,7 @@ HTML;
             
             <div onclick="this.querySelector('audio').play()" 
                  class="bg-zinc-900 hover:bg-zinc-800/70 border border-zinc-800 rounded-3xl p-5 cursor-pointer transition group">
-                <div class="text-xs text-zinc-400 line-clamp-1">Welcome to the control plane for AI voices.</div>
+                <div class="text-xs text-zinc-400 line-clamp-1">Welcome to the <emphasis>control plane</emphasis> for AI voices.</div>
                 <div class="mt-8 flex justify-between items-end">
                     <div>
                         <div class="text-emerald-300 text-sm">Bella</div>
@@ -669,6 +778,8 @@ HTML;
         $meta = $info['metadata'] ?? [];
         $characterCount = $meta['character_count'] ?? '142';
 
+        $escapedText = htmlspecialchars($text);
+
         return <<<HTML
 <div class="rounded-3xl bg-gradient-to-br from-zinc-800 to-zinc-900 border border-emerald-900 p-7 shadow-2xl">
     <div class="flex items-center gap-x-4 mb-6">
@@ -677,9 +788,9 @@ HTML;
         </div>
         <div class="flex-1 min-w-0">
             <div class="font-medium text-white text-lg leading-none">Generation successful</div>
-            <div class="text-emerald-400 text-sm mt-1">{$voiceName}</div>
+            <div class="text-emerald-400 text-sm mt-1">{$voiceName} • SSML applied</div>
         </div>
-        <div onclick="copyText(`{$text}`)" 
+        <div onclick="copyText(`{$escapedText}`)" 
              class="cursor-pointer text-xs bg-zinc-800 hover:bg-zinc-700 transition px-4 py-2 rounded-3xl flex items-center gap-x-2">
             <i class="fa-solid fa-copy"></i>
             <span>COPY</span>

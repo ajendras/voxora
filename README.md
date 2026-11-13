@@ -48,7 +48,7 @@ Encrypted scoped tokens with <code>KeyManager::issueToken()</code> and <code>val
 </td>
 <td valign="top" width="33%">
 🎙️ <b>Instant Synth</b><br>
-HTMX form in <code>DashboardController::generateAction()</code> with live preview
+HTMX form in <code>DashboardController::generateAction()</code> with rich SSML editor + live preview
 </td>
 </tr>
 <tr>
@@ -181,6 +181,24 @@ After login the top bar reflects the current user and role. Admins see additiona
 
 Visit `/dashboard` (after login), fill the form and click **GENERATE SPEECH**. The `DashboardController::generateAction()` returns a live audio fragment with player, download button and metadata. Stats and history are scoped to the logged-in user.
 
+### Rich SSML Editor
+
+The dashboard synthesis panel now includes a rich SSML editor. A toolbar provides one-click insertion of common SSML tags (`<break>`, `<prosody>`, `<emphasis>`, `<say-as>`). 
+
+- Place cursor or select text in the editor.
+- Click a toolbar button to insert or wrap with the tag.
+- Full SSML is supported; `<speak>` root is optional for ElevenLabs/Piper.
+- The right-hand panel delivers a **live preview** (HTMX-updated inline audio player) immediately after generation.
+
+Example SSML:
+
+```xml
+Hello <break time="800ms"/> my name is <prosody rate="slow" pitch="-5%">Voxora</prosody>.
+<emphasis level="strong">This is important.</emphasis>
+```
+
+The generated audio respects all prosody, pauses and emphasis.
+
 ### Voice cloning workflow
 
 **Via API (recommended for scripts):**
@@ -255,7 +273,7 @@ curl -X POST http://localhost:8080/api/v1/speech \
   -d 'text=Welcome to the control plane.&voice_id=21m00Tcm4TlvDq8ikWAM'
 ```
 
-Provider can be set to `piper` for local synthesis. Use `/api/v1/clone-voice` for cloning.
+Provider can be set to `piper` for local synthesis. Use `/api/v1/clone-voice` for cloning. SSML inside the `text` field is passed through to the provider.
 
 ## 🔧 Configuration
 
@@ -299,7 +317,7 @@ flowchart TD
     Users[(users table<br>role-based)]
 ```
 
-`Kernel` wires together `KeyManager`, `TTS\Manager`, `SqliteRepository` and the two controllers. All synthesis paths converge on `Manager::generate()`, which selects a `ProviderInterface` implementation, caches results and records usage. The dashboard uses HTMX fragments while the API returns JSON with public audio URLs. Sessions + `users` table enable multi-user isolation and role checks (`admin` vs `user`). Piper is used as automatic fallback for offline/resilient operation. Voice cloning is handled by `Manager::cloneVoice()` which delegates to the provider, stores the voice, and makes it available in `listLibrary()`.
+`Kernel` wires together `KeyManager`, `TTS\Manager`, `SqliteRepository` and the two controllers. All synthesis paths converge on `Manager::generate()`, which selects a `ProviderInterface` implementation, caches results and records usage. The dashboard uses HTMX fragments while the API returns JSON with public audio URLs. Sessions + `users` table enable multi-user isolation and role checks (`admin` vs `user`). Piper is used as automatic fallback for offline/resilient operation. Voice cloning is handled by `Manager::cloneVoice()` which delegates to the provider, stores the voice, and makes it available in `listLibrary()`. The new SSML editor lives inside `DashboardController::renderSynthPanel()` with pure-JS tag insertion that feeds directly into the existing HTMX generation flow.
 
 ## 📁 Project structure
 
@@ -320,7 +338,7 @@ flowchart TD
 │   │   ├── SynthesisResult.php   # common result value object (mp3/wav)
 │   │   └── Manager.php           # generate() with caching, usage recording & Piper fallback; cloneVoice()
 │   ├── Http/
-│   │   ├── DashboardController.php # HTMX pages + generateAction + login/logout
+│   │   ├── DashboardController.php # HTMX pages + generateAction + login/logout + rich SSML editor
 │   │   └── ApiController.php     # speechAction, historyAction, issueTokenAction, cloneVoiceAction (role-aware)
 │   ├── Storage/
 │   │   └── SqliteRepository.php  # schema (users + voices with is_cloned), authenticate(), listLibrary(), saveCustomVoice()
@@ -351,7 +369,7 @@ The test suite covers `KeyManager` token issuance, validation, expiry checks, en
 - [x] Add user authentication and role-based multi-user support
 - [x] Local TTS fallback via Piper using Symfony Process component
 - [x] Voice cloning workflow with sample upload to provider APIs
-- [ ] Rich SSML editor with live preview inside dashboard
+- [x] Rich SSML editor with live preview inside dashboard
 - [ ] FFmpeg integration for normalization, loudness and format conversion
 - [ ] Interactive usage analytics dashboard with Chart.js charts
 - [ ] Configurable webhooks on successful generation
