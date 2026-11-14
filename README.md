@@ -63,7 +63,7 @@ Curated voices stored and retrieved via <code>SqliteRepository::listLibrary()</c
 </td>
 <td valign="top">
 📊 <b>Analytics Hub</b><br>
-Usage stats, history and cost tracking through <code>SqliteRepository::getUsageStats()</code>
+Interactive Chart.js dashboard with daily trends, provider breakdown, summary cards and period filtering (scoped per-user)
 </td>
 </tr>
 <tr>
@@ -292,6 +292,18 @@ curl -X POST http://localhost:8080/api/v1/speech \
 
 Provider can be set to `piper` for local synthesis. Use `/api/v1/clone-voice` for cloning. SSML inside the `text` field is passed through to the provider. New fields control FFmpeg processing.
 
+### Analytics Dashboard
+
+After login visit **/dashboard**. The page now includes a full **Usage Analytics** section powered by Chart.js.
+
+- **Interactive line chart** — daily generations and total duration (hover for exact values, responsive).
+- **Doughnut chart** — breakdown by provider (ElevenLabs vs Piper).
+- **Summary KPI cards** — total generations, audio minutes, period selector.
+- **Period filtering** — click 7/30/60 days to dynamically update the line chart via client-side JS (no page reload).
+- Data is automatically scoped to the logged-in user (admins see aggregate view). Demo data is seeded on first run so charts are populated immediately.
+
+All analytics queries are powered by the expanded `SqliteRepository::getUsageStats()` which returns ready-to-chart data including filled date gaps.
+
 ## 🔧 Configuration
 
 | Option                        | Default               | Description |
@@ -336,9 +348,11 @@ flowchart TD
     Batch[BatchGenerator::run] --> Manager
     Manager --> Synthesis[SynthesisResult<br>(save, toDataUri, process)]
     Users[(users table<br>role-based)]
+    Repo --> Analytics[Analytics queries for Chart.js<br>(daily usage, provider breakdown)]
+    Dashboard --> Analytics
 ```
 
-`Kernel` wires together `KeyManager`, `TTS\Manager`, `SqliteRepository` and the two controllers. All synthesis paths converge on `Manager::generate()`, which selects a `ProviderInterface` implementation, caches results and records usage. The dashboard uses HTMX fragments while the API returns JSON with public audio URLs. Sessions + `users` table enable multi-user isolation and role checks (`admin` vs `user`). Piper is used as automatic fallback for offline/resilient operation. Voice cloning is handled by `Manager::cloneVoice()` which delegates to the provider, stores the voice, and makes it available in `listLibrary()`. The new SSML editor lives inside `DashboardController::renderSynthPanel()` with pure-JS tag insertion that feeds directly into the existing HTMX generation flow. **FFmpeg integration lives in `SynthesisResult::process()`** and is invoked automatically by `Manager`.
+`Kernel` wires together `KeyManager`, `TTS\Manager`, `SqliteRepository` and the two controllers. All synthesis paths converge on `Manager::generate()`, which selects a `ProviderInterface` implementation, caches results and records usage. The dashboard uses HTMX fragments while the API returns JSON with public audio URLs. Sessions + `users` table enable multi-user isolation and role checks (`admin` vs `user`). Piper is used as automatic fallback for offline/resilient operation. Voice cloning is handled by `Manager::cloneVoice()` which delegates to the provider, stores the voice, and makes it available in `listLibrary()`. The new SSML editor lives inside `DashboardController::renderSynthPanel()` with pure-JS tag insertion that feeds directly into the existing HTMX generation flow. **FFmpeg integration lives in `SynthesisResult::process()`** and is invoked automatically by `Manager`. The analytics dashboard is rendered server-side with Chart.js consuming JSON data produced by `SqliteRepository::getUsageStats()` (including automatic date-gap filling).
 
 ## 📁 Project structure
 
@@ -359,10 +373,10 @@ flowchart TD
 │   │   ├── SynthesisResult.php   # common result value object (mp3/wav) with FFmpeg process()
 │   │   └── Manager.php           # generate() with caching, usage recording & Piper fallback; cloneVoice()
 │   ├── Http/
-│   │   ├── DashboardController.php # HTMX pages + generateAction + login/logout + rich SSML editor
+│   │   ├── DashboardController.php # HTMX pages + generateAction + login/logout + rich SSML editor + analytics
 │   │   └── ApiController.php     # speechAction, historyAction, issueTokenAction, cloneVoiceAction (role-aware)
 │   ├── Storage/
-│   │   └── SqliteRepository.php  # schema (users + voices with is_cloned), authenticate(), listLibrary(), saveCustomVoice()
+│   │   └── SqliteRepository.php  # schema (users + voices with is_cloned), analytics queries, getUsageStats() with Chart.js data
 │   └── Automation/
 │       └── BatchGenerator.php    # run(csvPath, progress), Report value object
 ├── examples/
@@ -392,7 +406,7 @@ The test suite covers `KeyManager` token issuance, validation, expiry checks, en
 - [x] Voice cloning workflow with sample upload to provider APIs
 - [x] Rich SSML editor with live preview inside dashboard
 - [x] FFmpeg integration for normalization, loudness and format conversion
-- [ ] Interactive usage analytics dashboard with Chart.js charts
+- [x] Interactive usage analytics dashboard with Chart.js charts
 - [ ] Configurable webhooks on successful generation
 - [ ] Redis-backed rate limiter and request throttling
 - [ ] Plugin system for registering new TTS providers at runtime
