@@ -198,6 +198,9 @@ HTML;
     private function renderFullDashboard(array $voices, array $history, array $stats, array $user): string
     {
         $isAdmin = ($user['role'] ?? 'user') === 'admin';
+        $username = $user['username'] ?? 'user';
+        $role = $user['role'] ?? 'user';
+
         $voiceOptions = '';
         foreach ($voices as $voice) {
             $id = $voice['id'] ?? ($voice['voice_id'] ?? '');
@@ -273,8 +276,8 @@ HTML;
                 <div class="flex items-center gap-3">
                     <div class="w-8 h-8 bg-violet-500 rounded-full flex items-center justify-center text-xs font-bold">{$initial}</div>
                     <div>
-                        <div class="font-medium text-sm">{$user['username'] ?? 'user'}</div>
-                        <div class="text-xs text-zinc-500">{$user['role'] ?? 'user'}</div>
+                        <div class="font-medium text-sm">{$username}</div>
+                        <div class="text-xs text-zinc-500">{$role}</div>
                     </div>
                 </div>
                 <a href="/logout" class="block mt-6 text-xs text-red-400 hover:text-red-500">Logout</a>
