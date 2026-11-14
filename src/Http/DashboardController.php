@@ -215,6 +215,8 @@ HTML;
                 '</div>';
         }
 
+        $initial = strtoupper(substr($user['username'] ?? 'U', 0, 1));
+
         $ssmlToolbar = '
         <div class="flex gap-1 mb-2 flex-wrap">
             <button onclick="insertSSML(\'<break time=\"500ms\"/>\')" 
@@ -269,7 +271,7 @@ HTML;
             </div>
             <div class="mt-auto p-4 border-t border-zinc-800">
                 <div class="flex items-center gap-3">
-                    <div class="w-8 h-8 bg-violet-500 rounded-full flex items-center justify-center text-xs font-bold">{($user['username'][0] ?? 'U')}</div>
+                    <div class="w-8 h-8 bg-violet-500 rounded-full flex items-center justify-center text-xs font-bold">{$initial}</div>
                     <div>
                         <div class="font-medium text-sm">{$user['username'] ?? 'user'}</div>
                         <div class="text-xs text-zinc-500">{$user['role'] ?? 'user'}</div>
