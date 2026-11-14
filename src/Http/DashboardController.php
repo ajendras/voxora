@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Voxora\Http;
 
 use Voxora\TTS\Manager;
+use Voxora\TTS\SynthesisResult;
 use Voxora\Storage\SqliteRepository;
 use RuntimeException;
 use DateTimeImmutable;
@@ -200,6 +201,7 @@ HTML;
         $isAdmin = ($user['role'] ?? 'user') === 'admin';
         $username = $user['username'] ?? 'user';
         $role = $user['role'] ?? 'user';
+        $totalGenerations = $stats['total_generations'] ?? 0;
 
         $voiceOptions = '';
         foreach ($voices as $voice) {
@@ -290,7 +292,7 @@ HTML;
                     <h1 class="text-4xl font-semibold tracking-tight">Synthesis Studio</h1>
                     <div class="flex items-center gap-4 text-sm">
                         <div class="bg-emerald-900 text-emerald-300 px-3 py-1 rounded-full text-xs font-medium">ONLINE</div>
-                        <div>{$stats['total_generations'] ?? 0} generations</div>
+                        <div>{$totalGenerations} generations</div>
                     </div>
                 </div>
                 <!-- SSML Editor Panel -->
@@ -383,7 +385,7 @@ HTML;
 HTML;
     }
 
-    private function renderGenerationResult($result, string $url, string $text, string $voiceId): string
+    private function renderGenerationResult(SynthesisResult $result, string $url, string $text, string $voiceId): string
     {
         $duration = $result->duration ?? 0;
         $previewUri = $result->toDataUri();
@@ -431,10 +433,12 @@ HTML;
         $html .= '</form>';
         $html .= '<div class="grid grid-cols-2 gap-4">';
         foreach ($voices as $v) {
+            $name = $v['name'] ?? $v['id'] ?? 'Voice';
+            $id = $v['id'] ?? '';
             $isCloned = !empty($v['is_cloned']) ? '<span class="ml-2 text-[10px] bg-amber-400 text-black px-2 py-px rounded">CLONED</span>' : '';
             $html .= '<div class="bg-zinc-800 p-5 rounded-2xl">';
-            $html .= '<div class="font-medium">' . htmlspecialchars($v['name'] ?? ($v['id'] ?? 'Voice')) . $isCloned . '</div>';
-            $html .= '<div class="text-xs text-zinc-500 mt-1">' . htmlspecialchars($v['id'] ?? '') . '</div>';
+            $html .= '<div class="font-medium">' . htmlspecialchars($name) . $isCloned . '</div>';
+            $html .= '<div class="text-xs text-zinc-500 mt-1">' . htmlspecialchars($id) . '</div>';
             $html .= '</div>';
         }
         $html .= '</div></div>';
