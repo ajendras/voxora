@@ -10,181 +10,143 @@ use RuntimeException;
 /**
  * SynthesisResult
  *
- * Immutable value object holding generated audio data and metadata.
- * Now includes FFmpeg-powered post-processing for loudness normalization
- * (EBU R128 loudnorm filter), format conversion and duration extraction.
+ * Immutable value object for TTS output. Holds raw audio, format, provider,
+ * metadata and optional duration. The process() method applies FFmpeg-based
+ * normalization/format conversion with graceful degradation when FFmpeg
+ * is unavailable or fails.
  */
 final class SynthesisResult
 {
+    public readonly string $audioContent;
+    public readonly string $format;
+    public readonly string $provider;
+    public readonly array $metadata;
+    public readonly ?float $duration;
+
     public function __construct(
-        public readonly string $audioContent,
-        public readonly string $format = 'mp3',
-        public readonly ?float $duration = null,
-        public readonly array $metadata = []
+        string $audioContent,
+        string $format = 'mp3',
+        string $provider = 'elevenlabs',
+        array $metadata = [],
+        ?float $duration = null
     ) {
-        if (empty($this->audioContent)) {
-            throw new InvalidArgumentException('Audio content cannot be empty.');
-        }
+        $this->audioContent = $audioContent;
+        $this->format = $format;
+        $this->provider = $provider;
+        $this->metadata = $metadata;
+        $this->duration = $duration ?? ($format === 'wav' ? $this->parseWavDuration($audioContent) : null);
     }
 
-    public function save(string $path): void
-    {
-        $directory = dirname($path);
-        if (!is_dir($directory)) {
-            if (!mkdir($directory, 0755, true) && !is_dir($directory)) {
-                throw new RuntimeException('Failed to create directory: ' . $directory);
-            }
-        }
-
-        if (file_put_contents($path, $this->audioContent) === false) {
-            throw new RuntimeException('Failed to write audio to ' . $path);
-        }
-    }
-
-    public function toDataUri(): string
-    {
-        $mime = match (strtolower($this->format)) {
-            'wav' => 'audio/wav',
-            'ogg' => 'audio/ogg',
-            default => 'audio/mpeg',
-        };
-
-        return 'data:' . $mime . ';base64,' . base64_encode($this->audioContent);
-    }
-
-    /**
-     * Post-process audio with FFmpeg.
-     *
-     * Supports normalization (loudnorm filter), format conversion (mp3/wav)
-     * and returns a new immutable instance. Gracefully degrades when FFmpeg
-     * is unavailable (returns original unless normalization was explicitly requested).
-     *
-     * @param array $options Keys: normalize (bool), target_loudness (float), format (string), bitrate (string)
-     * @param string $ffmpegBinary Path to ffmpeg executable
-     * @return self
-     */
-    public function process(array $options = [], string $ffmpegBinary = 'ffmpeg'): self
+    public function process(array $options = []): self
     {
         $normalize = $options['normalize'] ?? true;
-        $targetLoudness = (float) ($options['target_loudness'] ?? -16.0);
-        $targetFormat = strtolower($options['format'] ?? $this->format);
-        $bitrate = $options['bitrate'] ?? ($targetFormat === 'mp3' ? '192k' : null);
+        $targetLoudness = $options['target_loudness'] ?? -16.0;
+        $targetFormat = $options['format'] ?? $this->format;
+        $ffmpegBinary = $options['ffmpeg_binary'] ?? 'ffmpeg';
 
         if (!$normalize && $targetFormat === $this->format) {
             return $this;
         }
 
-        if (!self::isAvailable($ffmpegBinary)) {
-            if ($normalize) {
-                throw new RuntimeException('FFmpeg is required for normalization but is not available in PATH.');
-            }
-            return $this; // format change skipped when ffmpeg unavailable
-        }
+        $inputFile = tempnam(sys_get_temp_dir(), 'vox_in_') . '.' . $this->format;
+        $outputFile = tempnam(sys_get_temp_dir(), 'vox_out_') . '.' . $targetFormat;
 
-        $inputExt = $this->format === 'mp3' ? 'mp3' : 'wav';
-        $outputExt = $targetFormat === 'mp3' ? 'mp3' : 'wav';
+        file_put_contents($inputFile, $this->audioContent);
 
-        $tmpInput = tempnam(sys_get_temp_dir(), 'vox_in_') . '.' . $inputExt;
-        $tmpOutput = tempnam(sys_get_temp_dir(), 'vox_out_') . '.' . $outputExt;
+        $filter = $normalize ? "loudnorm=I={$targetLoudness}:TP=-1:LRA=11" : 'anull';
+        $command = [
+            $ffmpegBinary,
+            '-i', $inputFile,
+            '-af', $filter,
+            '-ar', '22050',
+            '-y',
+            $outputFile,
+        ];
+
+        $process = new Process($command);
 
         try {
-            if (file_put_contents($tmpInput, $this->audioContent) === false) {
-                throw new RuntimeException('Failed to write temporary input file.');
+            $process->mustRun();
+
+            $newContent = file_get_contents($outputFile);
+            if ($newContent === false) {
+                throw new RuntimeException('Failed to read processed output');
             }
 
-            $args = [$ffmpegBinary, '-y', '-i', $tmpInput];
+            // Extract duration with ffprobe
+            $probeCmd = [
+                $ffmpegBinary,
+                '-i', $outputFile,
+                '-show_entries', 'format=duration',
+                '-of', 'csv=p=0',
+                '-v', 'quiet',
+            ];
+            $probe = new Process($probeCmd);
+            $probe->run();
+            $durStr = trim($probe->getOutput());
+            $newDuration = is_numeric($durStr) ? (float) $durStr : $this->duration;
 
-            $filters = [];
-            if ($normalize) {
-                $filters[] = "loudnorm=I={$targetLoudness}:TP=-1.0:LRA=11:linear=true";
-            }
-            if ($filters !== []) {
-                $args[] = '-af';
-                $args[] = implode(',', $filters);
-            }
-
-            if ($targetFormat === 'mp3') {
-                $args = array_merge($args, ['-codec:a', 'libmp3lame']);
-                if ($bitrate !== null) {
-                    $args = array_merge($args, ['-b:a', $bitrate]);
-                }
-            } else {
-                $args = array_merge($args, ['-acodec', 'pcm_s16le', '-ar', '22050']);
-            }
-
-            $args[] = $tmpOutput;
-
-            $process = new Process($args);
-            $process->setTimeout(30);
-            $process->run();
-
-            if (!$process->isSuccessful()) {
-                throw new RuntimeException('FFmpeg failed: ' . $process->getErrorOutput());
-            }
-
-            $newContent = file_get_contents($tmpOutput);
-            if ($newContent === false || strlen($newContent) < 100) {
-                throw new RuntimeException('Processed audio file is empty or corrupt.');
-            }
-
-            $newDuration = $this->measureDuration($ffmpegBinary, $tmpOutput) ?? $this->duration;
-
-            $newMetadata = array_merge($this->metadata, [
-                'processed' => true,
-                'normalized' => $normalize,
-                'target_loudness' => $targetLoudness,
-                'original_format' => $this->format,
-                'bitrate' => $bitrate,
-            ]);
+            @unlink($inputFile);
+            @unlink($outputFile);
 
             return new self(
                 $newContent,
                 $targetFormat,
-                $newDuration,
-                $newMetadata
+                $this->provider,
+                array_merge($this->metadata, ['normalized' => true, 'processed' => true]),
+                $newDuration
             );
-        } finally {
-            if (isset($tmpInput) && file_exists($tmpInput)) {
-                @unlink($tmpInput);
+        } catch (\Throwable $e) {
+            @unlink($inputFile);
+            if (file_exists($outputFile)) {
+                @unlink($outputFile);
             }
-            if (isset($tmpOutput) && file_exists($tmpOutput)) {
-                @unlink($tmpOutput);
-            }
+
+            $newMeta = $this->metadata;
+            $newMeta['normalized'] = false;
+            $newMeta['processing_error'] = $e->getMessage();
+
+            return new self(
+                $this->audioContent,
+                $this->format,
+                $this->provider,
+                $newMeta,
+                $this->duration
+            );
         }
     }
 
-    private static function isAvailable(string $binary): bool
+    private function parseWavDuration(string $content): ?float
     {
-        try {
-            $process = new Process([$binary, '-version']);
-            $process->setTimeout(5);
-            $process->run();
-
-            return $process->isSuccessful() && str_contains(strtolower($process->getOutput() . $process->getErrorOutput()), 'ffmpeg');
-        } catch (\Throwable) {
-            return false;
+        if (strlen($content) < 44) {
+            return null;
         }
+
+        $header = unpack(
+            'vNumChannels/VSampleRate/VByteRate',
+            substr($content, 22, 12)
+        );
+
+        if (!$header || ($header['SampleRate'] ?? 0) === 0) {
+            return null;
+        }
+
+        $dataSize = strlen($content) - 44;
+        return round($dataSize / $header['ByteRate'], 2);
     }
 
-    private function measureDuration(string $ffmpegBinary, string $filePath): ?float
+    public function save(string $path): void
     {
-        try {
-            $process = new Process([$ffmpegBinary, '-i', $filePath, '-f', 'null', '-']);
-            $process->setTimeout(10);
-            $process->run();
-
-            $output = $process->getErrorOutput();
-            if (preg_match('/Duration:\s*(\d+):(\d+):(\d+\.\d+)/', $output, $matches)) {
-                $hours = (int)$matches[1];
-                $minutes = (int)$matches[2];
-                $seconds = (float)$matches[3];
-
-                return ($hours * 3600) + ($minutes * 60) + $seconds;
-            }
-
-            return null;
-        } catch (\Throwable) {
-            return null;
+        $dir = dirname($path);
+        if (!is_dir($dir) && !mkdir($dir, 0755, true) && !is_dir($dir)) {
+            throw new RuntimeException('Failed to create directory: ' . $dir);
         }
+        file_put_contents($path, $this->audioContent);
+    }
+
+    public function toDataUri(): string
+    {
+        $mime = $this->format === 'wav' ? 'audio/wav' : 'audio/mpeg';
+        return 'data:' . $mime . ';base64,' . base64_encode($this->audioContent);
     }
 }
