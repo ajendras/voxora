@@ -395,6 +395,8 @@ composer test
 vendor/bin/phpunit
 ```
 
+PHPUnit is configured via `phpunit.xml.dist` (disables the result cache to avoid "Could not write test results to cache file" errors in CI environments such as the PHP 8.2 job).
+
 The test suite covers `KeyManager` token issuance, validation, expiry checks, encryption round-trips, scope enforcement and the new role/userId fields. New unit tests validate Piper WAV duration parsing and fallback paths. `PiperProviderTest` now also asserts that `cloneVoice()` throws the expected exception and that `SynthesisResult::process()` correctly handles normalization and format conversion (with graceful degradation when FFmpeg is unavailable).
 
 ## 📍 Roadmap
