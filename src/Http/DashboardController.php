@@ -6,6 +6,7 @@ namespace Voxora\Http;
 
 use Voxora\TTS\Manager;
 use Voxora\TTS\SynthesisResult;
+use Voxora\TTS\WebhookDispatcher;
 use Voxora\Storage\SqliteRepository;
 use RuntimeException;
 use DateTimeImmutable;
@@ -23,6 +24,7 @@ final class DashboardController
     private Manager $ttsManager;
     private SqliteRepository $repository;
     private array $config;
+    private WebhookDispatcher $webhookDispatcher;
     private array $demoVoices = [
         ['id' => '21m00Tcm4TlvDq8ikWAM', 'name' => 'Rachel', 'description' => 'American • Warm & versatile'],
         ['id' => 'AZnzlkDJ2myd1k8p7Q6X', 'name' => 'Domi', 'description' => 'American • Upbeat & clear'],
@@ -30,11 +32,16 @@ final class DashboardController
         ['id' => 'EXAVITQu4vr4xnSDxMaL', 'name' => 'Bella', 'description' => 'American • Friendly & expressive'],
     ];
 
-    public function __construct(Manager $ttsManager, SqliteRepository $repository, array $config)
-    {
+    public function __construct(
+        Manager $ttsManager,
+        SqliteRepository $repository,
+        array $config,
+        WebhookDispatcher $webhookDispatcher
+    ) {
         $this->ttsManager = $ttsManager;
         $this->repository = $repository;
         $this->config = $config;
+        $this->webhookDispatcher = $webhookDispatcher;
     }
 
     public function loginAction(): void
@@ -92,7 +99,13 @@ final class DashboardController
         }
 
         try {
-            $result = $this->ttsManager->generate($text, $voiceId, $provider);
+            $options = [
+                'normalize' => true,
+                'target_loudness' => -16.0,
+                'format' => 'mp3',
+            ];
+
+            $result = $this->ttsManager->generate($text, $voiceId, $provider, $options);
 
             $filename = 'synth-' . bin2hex(random_bytes(6)) . '.mp3';
             $audioDir = $this->config['audio']['directory'] ?? __DIR__ . '/../../storage/audio';
@@ -115,6 +128,14 @@ final class DashboardController
                 'metadata' => $result->metadata ?? [],
                 'audio_size_bytes' => strlen($result->audioContent ?? ''),
                 'generated_at' => (new DateTimeImmutable())->format('Y-m-d H:i:s'),
+                'user_id' => $_SESSION['user']['id'] ?? 1,
+            ]);
+
+            $this->webhookDispatcher->dispatchSuccess($result, [
+                'text' => $text,
+                'voice_id' => $voiceId,
+                'provider' => $provider ?? 'elevenlabs',
+                'audio_url' => $url,
                 'user_id' => $_SESSION['user']['id'] ?? 1,
             ]);
 

@@ -16,13 +16,15 @@ use Voxora\TTS\ElevenLabsProvider;
 use Voxora\TTS\Manager;
 use Voxora\TTS\PiperProvider;
 use Voxora\TTS\ProviderInterface;
+use Voxora\TTS\WebhookDispatcher;
 use RuntimeException;
 
 /**
  * Kernel
  *
  * Central application bootstrapper and request dispatcher.
- * Wires KeyManager, TTS Manager (with Piper fallback), Repository and SecurityMiddleware together.
+ * Wires KeyManager, TTS Manager (with Piper fallback), Repository, WebhookDispatcher
+ * and the controllers together.
  * Handles both HTMX dashboard routes and JSON API routes.
  */
 final class Kernel
@@ -33,6 +35,7 @@ final class Kernel
     private Manager $ttsManager;
     private SqliteRepository $repository;
     private SecurityMiddleware $securityMiddleware;
+    private WebhookDispatcher $webhookDispatcher;
 
     public function __construct(array $config)
     {
@@ -65,6 +68,9 @@ final class Kernel
         // TTS engine with available providers (Piper added as local fallback)
         $providers = $this->createTtsProviders();
         $this->ttsManager = new Manager($this->repository, ...$providers);
+
+        // Webhook dispatcher (new)
+        $this->webhookDispatcher = new WebhookDispatcher($this->config['webhooks'] ?? []);
 
         // Middleware for API token validation
         $this->securityMiddleware = new SecurityMiddleware($this->keyManager);
@@ -150,13 +156,15 @@ final class Kernel
             DashboardController::class => new DashboardController(
                 $this->ttsManager,
                 $this->repository,
-                $this->config
+                $this->config,
+                $this->webhookDispatcher
             ),
             ApiController::class => new ApiController(
                 $this->keyManager,
                 $this->ttsManager,
                 $this->repository,
-                $this->config
+                $this->config,
+                $this->webhookDispatcher
             ),
             default => new $class(),
         };
@@ -178,5 +186,10 @@ final class Kernel
     public function getRepository(): SqliteRepository
     {
         return $this->repository;
+    }
+
+    public function getWebhookDispatcher(): WebhookDispatcher
+    {
+        return $this->webhookDispatcher;
     }
 }

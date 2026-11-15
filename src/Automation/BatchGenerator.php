@@ -5,6 +5,8 @@ declare(strict_types=1);
 namespace Voxora\Automation;
 
 use Voxora\TTS\Manager;
+use Voxora\TTS\WebhookDispatcher;
+use Voxora\TTS\SynthesisResult;
 use RuntimeException;
 use InvalidArgumentException;
 use DateTimeImmutable;
@@ -22,14 +24,20 @@ final class BatchGenerator
 {
     private Manager $manager;
     private string $outputDir;
+    private ?WebhookDispatcher $webhookDispatcher;
 
     /**
      * @param Manager $manager TTS manager used for each generation
      * @param string $outputDir Directory where generated MP3s will be written
+     * @param WebhookDispatcher|null $webhookDispatcher Optional dispatcher for success events
      */
-    public function __construct(Manager $manager, string $outputDir = 'output')
-    {
+    public function __construct(
+        Manager $manager,
+        string $outputDir = 'output',
+        ?WebhookDispatcher $webhookDispatcher = null
+    ) {
         $this->manager = $manager;
+        $this->webhookDispatcher = $webhookDispatcher;
 
         if ($outputDir === '') {
             throw new InvalidArgumentException('Output directory cannot be empty.');
@@ -120,6 +128,18 @@ final class BatchGenerator
                 $generatedFiles[] = $filepath;
                 $successful++;
                 $totalDuration += (float) ($result->duration ?? 3.0);
+
+                if ($this->webhookDispatcher !== null) {
+                    $this->webhookDispatcher->dispatchSuccess($result, [
+                        'text' => $text,
+                        'voice_id' => $voiceId,
+                        'provider' => $provider ?? 'elevenlabs',
+                        'audio_url' => $filepath,
+                        'user_id' => null,
+                        'filename' => $filename,
+                        'batch' => true,
+                    ]);
+                }
 
                 if ($progress !== null) {
                     $progress($current, $total, "✓ Saved {$filename} (" . round((float) $result->duration, 1) . 's)', $filepath);

@@ -407,7 +407,7 @@ The test suite covers `KeyManager` token issuance, validation, expiry checks, en
 - [x] Rich SSML editor with live preview inside dashboard
 - [x] FFmpeg integration for normalization, loudness and format conversion
 - [x] Interactive usage analytics dashboard with Chart.js charts
-- [ ] Configurable webhooks on successful generation
+- [x] Configurable webhooks on successful generation
 - [ ] Redis-backed rate limiter and request throttling
 - [ ] Plugin system for registering new TTS providers at runtime
 - [ ] Scheduled batch jobs using native cron expressions

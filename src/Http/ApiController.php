@@ -7,6 +7,7 @@ namespace Voxora\Http;
 use Voxora\Security\KeyManager;
 use Voxora\Security\Token;
 use Voxora\TTS\Manager;
+use Voxora\TTS\WebhookDispatcher;
 use Voxora\Storage\SqliteRepository;
 use InvalidArgumentException;
 use RuntimeException;
@@ -25,17 +26,20 @@ final class ApiController
     private Manager $ttsManager;
     private SqliteRepository $repository;
     private array $config;
+    private WebhookDispatcher $webhookDispatcher;
 
     public function __construct(
         KeyManager $keyManager,
         Manager $ttsManager,
         SqliteRepository $repository,
-        array $config
+        array $config,
+        WebhookDispatcher $webhookDispatcher
     ) {
         $this->keyManager = $keyManager;
         $this->ttsManager = $ttsManager;
         $this->repository = $repository;
         $this->config = $config;
+        $this->webhookDispatcher = $webhookDispatcher;
     }
 
     /**
@@ -101,6 +105,15 @@ final class ApiController
                 'audio_size_bytes' => strlen($result->audioContent),
                 'generated_at' => (new DateTimeImmutable())->format('Y-m-d H:i:s'),
                 'user_id' => $token->userId ?? 1,
+            ]);
+
+            $this->webhookDispatcher->dispatchSuccess($result, [
+                'text' => $text,
+                'voice_id' => $voiceId,
+                'provider' => $input['provider'] ?? 'elevenlabs',
+                'audio_url' => $publicUrl,
+                'user_id' => $token->userId ?? 1,
+                'filename' => $filename,
             ]);
 
             return Response::json([
