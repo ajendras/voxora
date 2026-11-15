@@ -2,7 +2,9 @@ name: CI
 
 on:
   push:
+    branches: [ "main" ]
   pull_request:
+    branches: [ "main" ]
 
 permissions:
   contents: read
@@ -12,16 +14,33 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        php: ['8.2', '8.3']
+        php-version: ['8.2', '8.3']
+    name: test (${{ matrix.php-version }})
+
     steps:
       - uses: actions/checkout@v4
-      - uses: shivammathur/setup-php@v2
+
+      - name: Setup PHP ${{ matrix.php-version }}
+        uses: shivammathur/setup-php@v2
         with:
-          php-version: ${{ matrix.php }}
+          php-version: ${{ matrix.php-version }}
+          extensions: json, mbstring, sqlite3, sodium
           coverage: none
-      - name: Install
-        run: if [ -f composer.json ]; then composer install --no-interaction --prefer-dist --no-progress; fi
-      - name: Lint
-        run: find . -name '*.php' -not -path './vendor/*' -print0 | xargs -0 -r -n1 php -l
-      - name: Test
-        run: if [ -x vendor/bin/phpunit ]; then vendor/bin/phpunit; else echo "no phpunit"; fi
+
+      - name: Validate composer.json and composer.lock
+        run: composer validate --strict
+
+      - name: Cache Composer packages
+        id: composer-cache
+        uses: actions/cache@v4
+        with:
+          path: vendor
+          key: ${{ runner.os }}-php-${{ matrix.php-version }}-${{ hashFiles('**/composer.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-php-${{ matrix.php-version }}-
+
+      - name: Install dependencies
+        run: composer install --prefer-dist --no-progress
+
+      - name: Run test suite
+        run: composer test

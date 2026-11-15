@@ -98,7 +98,7 @@ FFmpeg integration for normalization, loudness (loudnorm filter targeting LUFS),
 
 **Requirements**
 
-- PHP 8.2+ with `ext-sqlite3`, `ext-sodium`, `ext-json`
+- PHP 8.2+ with `ext-sqlite3`, `ext-sodium`, `ext-json`, `ext-mbstring`
 - Composer
 - (Optional) Piper binary + voice model for local fallback
 - (Optional) FFmpeg CLI for normalization & format conversion
