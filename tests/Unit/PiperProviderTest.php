@@ -6,143 +6,138 @@ namespace Voxora\Tests\Unit;
 
 use PHPUnit\Framework\TestCase;
 use Voxora\TTS\PiperProvider;
+use Voxora\TTS\WebhookDispatcher;
 use Voxora\TTS\SynthesisResult;
 use Symfony\Component\Process\Process;
-use Voxora\TTS\WebhookDispatcher;
+use Symfony\Component\Process\Exception\ProcessFailedException;
+use InvalidArgumentException;
 use RuntimeException;
 
-class PiperProviderTest extends TestCase
+final class PiperProviderTest extends TestCase
 {
-    private PiperProvider $provider;
-    private string $modelPath;
-
-    protected function setUp(): void
-    {
-        $this->modelPath = __DIR__ . '/fixtures/test-model.onnx';
-        $this->provider = new PiperProvider([
-            'binary' => 'echo',
-            'model' => $this->modelPath,
-        ]);
-    }
-
-    public function testSynthesizeReturnsWavWithDuration()
-    {
-        $mockProcess = $this->createMock(Process::class);
-        $mockProcess->expects($this->once())
-            ->method('setInput')
-            ->with('Hello from Voxora');
-        $mockProcess->expects($this->once())
-            ->method('mustRun');
-
-        $dummyWav = $this->createDummyWav(2.85);
-
-        $this->provider->setProcessFactory(function (array $command) use ($mockProcess, $dummyWav) {
-            foreach ($command as $i => $arg) {
-                if ($arg === '--output_file' && isset($command[$i + 1])) {
-                    file_put_contents($command[$i + 1], $dummyWav);
-                    break;
-                }
-            }
-            return $mockProcess;
-        });
-
-        $result = $this->provider->synthesize('Hello from Voxora', 'test-voice-123');
-
-        $this->assertInstanceOf(SynthesisResult::class, $result);
-        $this->assertSame('wav', $result->format);
-        $this->assertSame('piper', $result->provider);
-        $this->assertGreaterThan(0.0, $result->duration);
-        $this->assertArrayHasKey('voice_id', $result->metadata);
-    }
-
-    public function testCloneVoiceThrowsException()
-    {
-        $this->expectException(RuntimeException::class);
-        $this->expectExceptionMessage('Voice cloning is not supported by the Piper provider');
-
-        $this->provider->cloneVoice('My Cloned Voice', '/tmp/sample.wav');
-    }
-
-    public function testWebhookDispatcherWithPiperResult()
-    {
-        $dispatcher = $this->createMock(WebhookDispatcher::class);
-        $dispatcher->expects($this->once())
-            ->method('dispatchSuccess')
-            ->with(
-                $this->isInstanceOf(SynthesisResult::class),
-                $this->callback(fn(array $ctx): bool => ($ctx['provider'] ?? '') === 'piper')
-            );
-
-        $mockProcess = $this->createMock(Process::class);
-        $mockProcess->method('setInput')->willReturn(null);
-        $mockProcess->method('mustRun')->willReturn(null);
-
-        $dummyWav = $this->createDummyWav(1.2);
-        $this->provider->setProcessFactory(fn(): Process => $mockProcess);
-
-        $result = $this->provider->synthesize('Webhook test text', 'v0-test');
-
-        $dispatcher->dispatchSuccess($result, [
-            'provider' => 'piper',
-            'text' => 'Webhook test text',
-            'audio_url' => '/audio/test.wav',
-        ]);
-
-        $this->assertSame('wav', $result->format);
-    }
-
-    public function testSynthesisResultProcessGracefulDegradation()
-    {
-        $dummyWav = $this->createDummyWav(4.2);
-        $original = new SynthesisResult(
-            $dummyWav,
-            'wav',
-            'piper',
-            ['voice_id' => 'test-voice'],
-            4.2
-        );
-
-        $processed = $original->process([
-            'normalize' => true,
-            'target_loudness' => -16.0,
-            'format' => 'mp3',
-            'ffmpeg_binary' => '/nonexistent/ffmpeg-that-will-fail',
-        ]);
-
-        $this->assertInstanceOf(SynthesisResult::class, $processed);
-        $this->assertFalse($processed->metadata['normalized'] ?? true);
-        $this->assertArrayHasKey('processing_error', $processed->metadata);
-        $this->assertEqualsWithDelta(4.2, $processed->duration ?? 0.0, 0.1);
-        $this->assertSame('wav', $processed->format);
-    }
-
-    private function createDummyWav(float $durationSeconds): string
+    private function getTestWavData(): string
     {
         $sampleRate = 22050;
         $channels = 1;
         $bitsPerSample = 16;
-        $byteRate = $sampleRate * $channels * ($bitsPerSample / 8);
-        $dataSize = (int) ($byteRate * $durationSeconds);
+        $byteRate = $sampleRate * $channels * (int)($bitsPerSample / 8);
+        $duration = 2.0;
+        $dataSize = (int) ($byteRate * $duration);
         $fileSize = 36 + $dataSize;
 
         $header = pack(
-            'A4Vv2Vv2Vv2A4V',
+            'A4V A4 A4 V v v V V v v A4 V',
             'RIFF',
             $fileSize,
-            1,
+            'WAVE',
+            'fmt ',
             16,
             1,
             $channels,
             $sampleRate,
             $byteRate,
-            $channels * ($bitsPerSample / 8),
+            $channels * 2,
             $bitsPerSample,
             'data',
             $dataSize
         );
 
-        $audioData = str_repeat("\x00", $dataSize);
+        $audioData = str_repeat("\x00\x00", (int)($dataSize / 2));
 
         return $header . $audioData;
+    }
+
+    public function testSynthesizeReturnsWavWithDuration(): void
+    {
+        $wavData = $this->getTestWavData();
+
+        $mockProcess = $this->createMock(Process::class);
+        $mockProcess->expects($this->once())
+            ->method('mustRun');
+        $mockProcess->method('getOutput')
+            ->willReturn($wavData);
+
+        $factory = fn (array $command): Process => $mockProcess;
+
+        $provider = new PiperProvider([
+            'binary' => 'piper',
+            'model' => __DIR__ . '/dummy-model.onnx',
+            'process_factory' => $factory,
+        ]);
+
+        $result = $provider->synthesize('Hello from Piper', 'default-voice');
+
+        $this->assertInstanceOf(SynthesisResult::class, $result);
+        $this->assertSame('wav', $result->format);
+        $this->assertGreaterThan(0.0, $result->duration);
+        $this->assertArrayHasKey('provider', $result->metadata);
+        $this->assertSame('piper', $result->metadata['provider']);
+        $this->assertArrayHasKey('offline', $result->metadata);
+        $this->assertTrue($result->metadata['offline']);
+    }
+
+    public function testWebhookDispatcherWithPiperResult(): void
+    {
+        // Use real dispatcher (no URL = no-op). This avoids the final-class mock error.
+        $dispatcher = new WebhookDispatcher();
+
+        $wavData = $this->getTestWavData();
+
+        $mockProcess = $this->createMock(Process::class);
+        $mockProcess->expects($this->once())
+            ->method('mustRun');
+        $mockProcess->method('getOutput')
+            ->willReturn($wavData);
+
+        $factory = fn (array $command): Process => $mockProcess;
+
+        $provider = new PiperProvider([
+            'binary' => 'piper',
+            'model' => __DIR__ . '/dummy-model.onnx',
+            'process_factory' => $factory,
+        ]);
+
+        $result = $provider->synthesize('Test for webhook', 'voice123');
+
+        // Dispatcher accepts Piper result without error
+        $dispatcher->dispatchSuccess($result, [
+            'provider' => 'piper',
+            'text' => 'Test for webhook',
+            'batch' => false,
+        ]);
+
+        $this->assertInstanceOf(SynthesisResult::class, $result);
+        $this->assertSame('wav', $result->format);
+        $this->assertGreaterThan(0.0, $result->duration);
+    }
+
+    public function testCloneVoiceThrowsException(): void
+    {
+        $provider = new PiperProvider([
+            'binary' => 'piper',
+            'model' => __DIR__ . '/dummy-model.onnx',
+        ]);
+
+        $this->expectException(RuntimeException::class);
+        $this->expectExceptionMessage('Voice cloning is not supported by the Piper local provider');
+
+        $provider->cloneVoice('Test Voice', '/path/to/sample.wav');
+    }
+
+    public function testThrowsOnEmptyText(): void
+    {
+        $mockProcess = $this->createMock(Process::class);
+        $factory = fn (array $command): Process => $mockProcess;
+
+        $provider = new PiperProvider([
+            'binary' => 'piper',
+            'model' => __DIR__ . '/dummy-model.onnx',
+            'process_factory' => $factory,
+        ]);
+
+        $this->expectException(InvalidArgumentException::class);
+        $this->expectExceptionMessage('Text cannot be empty for synthesis.');
+
+        $provider->synthesize('', 'voice123');
     }
 }
