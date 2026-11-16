@@ -31,6 +31,7 @@ Developers integrating high-quality voices face fragmented provider APIs, expose
 - **Voice cloning** — Upload audio samples directly to provider APIs (`Manager::cloneVoice()`) with results persisted as reusable custom voices.
 - **Audio post-processing** — FFmpeg integration for loudness normalization (EBU R128 loudnorm), peak limiting, format conversion (MP3/WAV) and duration measurement.
 - **Production ready** — Redis-backed rate limiter prevents abuse with per-user/token throttling (fails open on Redis outage).
+- **Plugin system** — Register new TTS providers at runtime with `Manager::registerProvider()`; they are automatically available in the dashboard, API, batch jobs and analytics.
 
 ## 🎬 Demo
 
@@ -97,6 +98,12 @@ FFmpeg integration for normalization, loudness (loudnorm filter targeting LUFS),
 <td valign="top" colspan="3">
 🚦 <b>Rate Limiter</b><br>
 Redis-backed request throttling (<code>RateLimiter</code>) with configurable per-user/token windows; returns 429 on exceed, fails-open on Redis outage
+</td>
+</tr>
+<tr>
+<td valign="top" colspan="3">
+🔌 <b>Plugin System</b><br>
+Register new TTS providers at runtime with <code>Manager::registerProvider('myprovider', $instance)</code>. Custom providers appear automatically in UI, API, batch jobs and analytics.
 </td>
 </tr>
 </table>
@@ -246,6 +253,36 @@ $voiceId = $manager->cloneVoice(
 
 The sample is posted as multipart to the provider, the voice is persisted in the `voices` SQLite table (with `is_cloned=1`), and can be used in any `generate()` call.
 
+### Plugin system for new TTS providers
+
+After booting the kernel you can register arbitrary `ProviderInterface` implementations at runtime. They become instantly available everywhere (dashboard dropdown, API, batch processing, analytics).
+
+```php
+use Voxora\Kernel;
+use MyApp\OpenAITTSProvider; // your implementation
+
+$config = require __DIR__ . '/config/app.php';
+$kernel = new Kernel($config);
+$kernel->boot();
+
+$manager = $kernel->getTtsManager();
+
+// Register at runtime (plugin system)
+$openai = new OpenAITTSProvider(['api_key' => 'sk-...']);
+$manager->registerProvider('openai', $openai);
+
+// Use it immediately
+$result = $manager->generate(
+    text: "Hello from OpenAI TTS",
+    voiceId: "alloy",
+    provider: "openai"
+);
+
+$result->save('output/openai.mp3');
+```
+
+You can also define custom providers in `config/app.php` under the `providers` key with a `class` entry; Kernel will instantiate and register them automatically.
+
 ### Issue a scoped API token
 
 ```php
@@ -345,6 +382,7 @@ All analytics queries are powered by the expanded `SqliteRepository::getUsageSta
 | `providers.eleven.base_uri`   | `https://api.elevenlabs.io/v1` | Base URL for the ElevenLabs API |
 | `providers.piper.binary`      | `piper`               | Path to Piper CLI binary (must be executable) |
 | `providers.piper.model`       | (required for fallback) | Path to Piper .onnx voice model file |
+| `providers.*.class`           | —                     | Class name for custom providers (auto-registered by Kernel) |
 | `audio.directory`             | `storage/audio`       | Directory where `ApiController::speechAction()` saves generated MP3s |
 | `audio.public_url_prefix`     | `/audio`              | Public URL prefix returned in JSON responses |
 | `ffmpeg.binary`               | `ffmpeg`              | Path to FFmpeg binary (used by SynthesisResult::process()) |
@@ -375,6 +413,9 @@ flowchart TD
     Api --> KeyManager[KeyManager::validate<br>(role + userId)]
     Api --> Manager[TTS\Manager::generate or cloneVoice]
     Dashboard --> Manager
+    Manager --> Registry[Provider registry (plugin system)]
+    Registry --> BuiltIn[Built-in: ElevenLabsProvider, PiperProvider<br>(registered by Kernel)]
+    Registry --> Plugins[Runtime plugins via registerProvider()]
     Manager --> Provider[ProviderInterface]
     Provider --> ElevenLabs[ElevenLabsProvider<br>(/voices/add for cloning)]
     Provider --> Piper[PiperProvider<br>(throws on clone)]
@@ -391,7 +432,7 @@ flowchart TD
     Dashboard --> Analytics
 ```
 
-`Kernel` wires together `KeyManager`, `TTS\Manager`, `SqliteRepository` and the two controllers. All synthesis paths converge on `Manager::generate()`, which selects a `ProviderInterface` implementation, caches results and records usage. The dashboard uses HTMX fragments while the API returns JSON with public audio URLs. Sessions + `users` table enable multi-user isolation and role checks (`admin` vs `user`). Piper is used as automatic fallback for offline/resilient operation. Voice cloning is handled by `Manager::cloneVoice()` which delegates to the provider, stores the voice, and makes it available in `listLibrary()`. The new SSML editor lives inside `DashboardController::renderSynthPanel()` with pure-JS tag insertion that feeds directly into the existing HTMX generation flow. **FFmpeg integration lives in `SynthesisResult::process()`** and is invoked automatically by `Manager`. The analytics dashboard is rendered server-side with Chart.js consuming JSON data produced by `SqliteRepository::getUsageStats()` (including automatic date-gap filling). **RateLimiter** sits in front of protected actions and uses Redis counters (per-user or per-IP) to enforce throttling.
+`Kernel` wires together `KeyManager`, `TTS\Manager`, `SqliteRepository` and the two controllers. All synthesis paths converge on `Manager::generate()`, which selects a `ProviderInterface` implementation, caches results and records usage. The dashboard uses HTMX fragments while the API returns JSON with public audio URLs. Sessions + `users` table enable multi-user isolation and role checks (`admin` vs `user`). Piper is used as automatic fallback for offline/resilient operation. Voice cloning is handled by `Manager::cloneVoice()` which delegates to the provider, stores the voice, and makes it available in `listLibrary()`. The new SSML editor lives inside `DashboardController::renderSynthPanel()` with pure-JS tag insertion that feeds directly into the existing HTMX generation flow. **FFmpeg integration lives in `SynthesisResult::process()`** and is invoked automatically by `Manager`. The analytics dashboard is rendered server-side with Chart.js consuming JSON data produced by `SqliteRepository::getUsageStats()` (including automatic date-gap filling). **RateLimiter** sits in front of protected actions and uses Redis counters (per-user or per-IP) to enforce throttling. The plugin system lives in `Manager::registerProvider()` and is populated at boot by `Kernel`; any `ProviderInterface` can be added at runtime and is automatically surfaced in the UI, API and batch runner.
 
 ## 📁 Project structure
 
@@ -410,7 +451,7 @@ flowchart TD
 │   │   ├── ElevenLabsProvider.php # implements cloning via /v1/voices/add
 │   │   ├── PiperProvider.php     # local synthesis via Symfony Process + WAV output (throws on clone)
 │   │   ├── SynthesisResult.php   # common result value object (mp3/wav) with FFmpeg process()
-│   │   └── Manager.php           # generate() with caching, usage recording & Piper fallback; cloneVoice()
+│   │   └── Manager.php           # generate() with caching, usage recording & Piper fallback; cloneVoice(); registerProvider() plugin system
 │   ├── Http/
 │   │   ├── DashboardController.php # HTMX pages + generateAction + login/logout + rich SSML editor + analytics
 │   │   └── ApiController.php     # speechAction, historyAction, issueTokenAction, cloneVoiceAction (role-aware)
@@ -436,7 +477,7 @@ vendor/bin/phpunit
 
 PHPUnit is configured via `phpunit.xml.dist` (disables the result cache to avoid "Could not write test results to cache file" errors in CI environments such as the PHP 8.2 job).
 
-The test suite covers `KeyManager` token issuance, validation, expiry checks, encryption round-trips, scope enforcement and the new role/userId fields. `PiperProviderTest` validates WAV duration extraction from the RIFF header (using a mocked Symfony Process for reliable CI runs), confirms `cloneVoice()` throws as expected, and exercises `WebhookDispatcher` with Piper results without attempting to mock the final dispatcher class. RateLimiter behavior (allowed/blocked windows, mock Redis interactions) is covered inside `KeyManagerTest`.
+The test suite covers `KeyManager` token issuance, validation, expiry checks, encryption round-trips, scope enforcement and the new role/userId fields. `PiperProviderTest` validates WAV duration extraction from the RIFF header (using a mocked Symfony Process for reliable CI runs), confirms `cloneVoice()` throws as expected, and exercises `WebhookDispatcher` with Piper results without attempting to mock the final dispatcher class. RateLimiter behavior (allowed/blocked windows, mock Redis interactions) is covered inside `KeyManagerTest`. New tests cover the plugin registration API and resolution of custom providers.
 
 ## 📍 Roadmap
 
@@ -450,7 +491,7 @@ The test suite covers `KeyManager` token issuance, validation, expiry checks, en
 - [x] Interactive usage analytics dashboard with Chart.js charts
 - [x] Configurable webhooks on successful generation
 - [x] Redis-backed rate limiter and request throttling
-- [ ] Plugin system for registering new TTS providers at runtime
+- [x] Plugin system for registering new TTS providers at runtime
 - [ ] Scheduled batch jobs using native cron expressions
 - [ ] Dark/light mode persistence and improved accessibility
 - [ ] Exportable voice library as portable JSON bundles

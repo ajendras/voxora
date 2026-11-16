@@ -4,23 +4,36 @@ declare(strict_types=1);
 
 namespace Voxora\TTS;
 
+use Voxora\TTS\SynthesisResult;
+
 /**
  * ProviderInterface
  *
- * Common contract for all TTS backends (ElevenLabs, Piper, future plugins).
- * The returned SynthesisResult can be further processed with FFmpeg via
- * $result->process(['normalize' => true, 'target_loudness' => -16.0, 'format' => 'mp3']).
+ * Contract for all TTS backends. The plugin system (Manager::registerProvider)
+ * allows any implementation to be added at runtime. Built-in implementations
+ * are ElevenLabsProvider and PiperProvider.
  */
 interface ProviderInterface
 {
     /**
-     * Synthesize speech. ElevenLabs returns MP3; Piper returns WAV.
-     * Post-processing (normalization, conversion) is handled by Manager.
+     * Synthesize text (or SSML) into audio.
+     *
+     * @param string $text Text or SSML content
+     * @param string $voiceId Voice identifier
+     * @param array<string, mixed> $options Options such as format, normalize, target_loudness
+     * @return SynthesisResult
      */
-    public function synthesize(string $text, string $voiceId): SynthesisResult;
+    public function synthesize(string $text, string $voiceId, array $options = []): SynthesisResult;
 
     /**
-     * Clone a voice from an audio sample. Piper throws; ElevenLabs calls /v1/voices/add.
+     * Clone a voice from an audio sample. Providers that do not support cloning
+     * (e.g. Piper) must throw RuntimeException.
+     *
+     * @param string $name Human-readable name for the cloned voice
+     * @param string $samplePath Path to the audio sample file
+     * @param array<string, mixed> $options Provider-specific options
+     * @return string The provider-assigned voice identifier
+     * @throws \RuntimeException When cloning is not supported
      */
-    public function cloneVoice(string $name, string $samplePath): string;
+    public function cloneVoice(string $name, string $samplePath, array $options = []): string;
 }

@@ -8,157 +8,202 @@ use Voxora\Http\ApiController;
 use Voxora\Http\DashboardController;
 use Voxora\Http\Request;
 use Voxora\Http\Response;
-use Voxora\Http\Router;
 use Voxora\Security\KeyManager;
 use Voxora\Security\RateLimiter;
 use Voxora\Storage\SqliteRepository;
 use Voxora\TTS\ElevenLabsProvider;
 use Voxora\TTS\Manager;
 use Voxora\TTS\PiperProvider;
+use Voxora\TTS\ProviderInterface;
 use Voxora\TTS\WebhookDispatcher;
-use Predis\Client as PredisClient;
+use Predis\Client as RedisClient;
 use RuntimeException;
 
 /**
  * Kernel
  *
- * Central application bootstrapper and request dispatcher.
- * Wires KeyManager, TTS Manager (with Piper fallback), Repository, WebhookDispatcher,
- * RateLimiter (Redis) and the controllers together.
- * Handles both HTMX dashboard routes and JSON API routes.
+ * Bootstraps services, registers built-in TTS providers and exposes the
+ * plugin system through the Manager. Additional providers can be registered
+ * at runtime after boot() using $kernel->getTtsManager()->registerProvider().
  */
 final class Kernel
 {
     private array $config;
-    private Router $router;
-    private KeyManager $keyManager;
-    private Manager $ttsManager;
-    private SqliteRepository $repository;
-    private WebhookDispatcher $webhookDispatcher;
-    private RateLimiter $rateLimiter;
+    private ?SqliteRepository $repository = null;
+    private ?Manager $ttsManager = null;
+    private ?KeyManager $keyManager = null;
+    private ?RateLimiter $rateLimiter = null;
+    private ?WebhookDispatcher $webhookDispatcher = null;
+    private ?RedisClient $redis = null;
 
     public function __construct(array $config)
     {
         $this->config = $config;
+
+        if (empty($config['security']['encrypt_key'])) {
+            throw new RuntimeException('security.encrypt_key is required');
+        }
     }
 
-    public function boot(): self
+    public function boot(): void
     {
         if (session_status() !== PHP_SESSION_ACTIVE) {
             session_start();
         }
-
-        $storagePath = $this->config['storage']['path'] ?? 'data/voxora.db';
-        $this->repository = new SqliteRepository($storagePath);
-        $this->repository->ensureSchema();
-
-        $encryptKey = $this->config['security']['encrypt_key'] ?? null;
-        if ($encryptKey === null || strlen($encryptKey) < 16) {
-            throw new RuntimeException('security.encrypt_key is required and must be sufficiently long');
-        }
-
-        $this->keyManager = new KeyManager(
-            $encryptKey,
-            $this->config['security']['token_lifetime_days'] ?? 90
-        );
-
-        $elevenConfig = $this->config['providers']['eleven'] ?? [];
-        $piperConfig = $this->config['providers']['piper'] ?? [];
-
-        $elevenProvider = new ElevenLabsProvider($elevenConfig);
-        $piperProvider = new PiperProvider($piperConfig);
-
-        $this->ttsManager = new Manager(
-            $elevenProvider,
-            $piperProvider,
-            $this->repository,
-            $this->config
-        );
-
-        $this->webhookDispatcher = new WebhookDispatcher(
-            $this->config['webhooks'] ?? []
-        );
-
-        // Redis-backed rate limiter
-        $redisConfig = $this->config['redis'] ?? [
-            'host' => '127.0.0.1',
-            'port' => 6379,
-        ];
-        $predisOptions = [
-            'scheme' => 'tcp',
-            'host' => $redisConfig['host'],
-            'port' => (int) $redisConfig['port'],
-        ];
-        if (isset($redisConfig['password'])) {
-            $predisOptions['password'] = $redisConfig['password'];
-        }
-        $client = new PredisClient($predisOptions);
-
-        $rateConfig = $this->config['rate_limit'] ?? [
-            'requests' => 100,
-            'window' => 60,
-        ];
-        $this->rateLimiter = new RateLimiter(
-            $client,
-            (int) $rateConfig['requests'],
-            (int) $rateConfig['window']
-        );
-
-        $this->router = new Router();
-
-        $dashboardController = new DashboardController(
-            $this->ttsManager,
-            $this->repository,
-            $this->config,
-            $this->webhookDispatcher,
-            $this->rateLimiter
-        );
-
-        $apiController = new ApiController(
-            $this->keyManager,
-            $this->ttsManager,
-            $this->repository,
-            $this->config,
-            $this->webhookDispatcher,
-            $this->rateLimiter
-        );
-
-        // Register routes
-        $this->router->get('/login', fn() => $dashboardController->loginAction());
-        $this->router->post('/login', fn() => $dashboardController->loginAction());
-        $this->router->get('/dashboard', fn() => $dashboardController->indexAction());
-        $this->router->post('/dashboard/generate', fn() => $dashboardController->generateAction());
-        $this->router->get('/library', fn() => $dashboardController->libraryAction());
-        $this->router->get('/logout', fn() => $dashboardController->logoutAction());
-
-        $this->router->post('/api/v1/speech', fn(Request $r) => $apiController->speechAction($r));
-        $this->router->get('/api/v1/history', fn(Request $r) => $apiController->historyAction($r));
-        $this->router->post('/api/v1/tokens', fn(Request $r) => $apiController->issueTokenAction($r));
-        $this->router->get('/api/v1/voices', fn(Request $r) => $apiController->listVoicesAction($r));
-        $this->router->post('/api/v1/clone-voice', fn(Request $r) => $apiController->cloneVoiceAction($r));
-
-        return $this;
-    }
-
-    public function handle(): void
-    {
-        $request = Request::fromGlobals();
-        $response = $this->router->dispatch($request);
-        $response->send();
+        $this->getRepository();
     }
 
     public function getTtsManager(): Manager
     {
+        if ($this->ttsManager === null) {
+            $repo = $this->getRepository();
+            $dispatcher = $this->getWebhookDispatcher();
+            $this->ttsManager = new Manager($repo, $this->config, $dispatcher);
+
+            // Register built-in providers (core of the plugin system)
+            $elevenConfig = $this->config['providers']['elevenlabs'] ?? $this->config['providers']['eleven'] ?? [];
+            $this->ttsManager->registerProvider('elevenlabs', new ElevenLabsProvider($elevenConfig));
+
+            $piperConfig = $this->config['providers']['piper'] ?? [];
+            $this->ttsManager->registerProvider('piper', new PiperProvider($piperConfig));
+
+            // Auto-register any custom providers defined in config (plugin support)
+            foreach ($this->config['providers'] ?? [] as $name => $providerConfig) {
+                if (isset($providerConfig['class']) && class_exists($providerConfig['class'])) {
+                    $instance = new $providerConfig['class']($providerConfig);
+                    if ($instance instanceof ProviderInterface) {
+                        $this->ttsManager->registerProvider($name, $instance);
+                    }
+                }
+            }
+        }
+
         return $this->ttsManager;
     }
 
     public function getKeyManager(): KeyManager
     {
+        if ($this->keyManager === null) {
+            $this->keyManager = new KeyManager(
+                $this->config['security']['encrypt_key'],
+                $this->getRepository(),
+                $this->config['security']['token_lifetime_days'] ?? 90
+            );
+        }
         return $this->keyManager;
     }
 
     public function getRateLimiter(): RateLimiter
     {
+        if ($this->rateLimiter === null) {
+            $this->rateLimiter = new RateLimiter(
+                $this->getRedis(),
+                $this->config['rate_limit'] ?? ['requests' => 100, 'window' => 60]
+            );
+        }
         return $this->rateLimiter;
+    }
+
+    public function getRepository(): SqliteRepository
+    {
+        if ($this->repository === null) {
+            $path = $this->config['storage']['path'] ?? __DIR__ . '/../data/voxora.db';
+            $dir = dirname($path);
+            if (!is_dir($dir)) {
+                mkdir($dir, 0755, true);
+            }
+            $this->repository = new SqliteRepository($path);
+            $this->repository->migrate();
+        }
+        return $this->repository;
+    }
+
+    private function getWebhookDispatcher(): WebhookDispatcher
+    {
+        if ($this->webhookDispatcher === null) {
+            $this->webhookDispatcher = new WebhookDispatcher(
+                $this->config['webhooks'] ?? []
+            );
+        }
+        return $this->webhookDispatcher;
+    }
+
+    private function getRedis(): RedisClient
+    {
+        if ($this->redis === null) {
+            $this->redis = new RedisClient([
+                'host' => $this->config['redis']['host'] ?? '127.0.0.1',
+                'port' => $this->config['redis']['port'] ?? 6379,
+            ]);
+            if (!empty($this->config['redis']['password'])) {
+                $this->redis->auth($this->config['redis']['password']);
+            }
+        }
+        return $this->redis;
+    }
+
+    public function handle(): void
+    {
+        $this->boot();
+
+        $path = parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH);
+        $method = $_SERVER['REQUEST_METHOD'] ?? 'GET';
+
+        $ttsManager = $this->getTtsManager();
+        $repository = $this->getRepository();
+        $config = $this->config;
+        $webhook = $this->getWebhookDispatcher();
+        $keyManager = $this->getKeyManager();
+        $rateLimiter = $this->getRateLimiter();
+
+        if (in_array($path, ['/login', '/'], true)) {
+            (new DashboardController($ttsManager, $repository, $config, $webhook))->loginAction();
+            return;
+        }
+
+        if ($path === '/dashboard') {
+            (new DashboardController($ttsManager, $repository, $config, $webhook))->indexAction();
+            return;
+        }
+
+        if ($path === '/dashboard/generate' && $method === 'POST') {
+            echo (new DashboardController($ttsManager, $repository, $config, $webhook))->generateAction();
+            return;
+        }
+
+        if ($path === '/library') {
+            (new DashboardController($ttsManager, $repository, $config, $webhook))->libraryAction();
+            return;
+        }
+
+        if ($path === '/logout') {
+            (new DashboardController($ttsManager, $repository, $config, $webhook))->logoutAction();
+            return;
+        }
+
+        if (str_starts_with($path, '/api/v1/')) {
+            $api = new ApiController(
+                $keyManager,
+                $ttsManager,
+                $repository,
+                $config,
+                $webhook,
+                $rateLimiter
+            );
+            $request = new Request();
+            $response = match ($path) {
+                '/api/v1/speech' => $api->speechAction($request),
+                '/api/v1/history' => $api->historyAction($request),
+                '/api/v1/tokens' => $api->issueTokenAction($request),
+                '/api/v1/voices' => $api->listVoicesAction($request),
+                '/api/v1/clone-voice' => $api->cloneVoiceAction($request),
+                default => Response::json(['error' => 'Not found'], 404),
+            };
+            $response->send();
+            return;
+        }
+
+        http_response_code(404);
+        echo 'Not Found';
     }
 }

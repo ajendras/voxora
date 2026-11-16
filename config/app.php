@@ -1,31 +1,31 @@
 <?php
 
-declare(strict_types=1);
-
-/**
- * Voxora Application Configuration
- *
- * Copy this file (or the example) and customize the values for your environment.
- * All TTS, security, storage, audio, FFmpeg and webhook settings live here.
- */
+// Configuration for Voxora.
+// Copy this file to config/app.php and fill in your credentials.
 
 return [
     'security' => [
-        'encrypt_key' => 'change-this-to-a-long-random-secret-min-32-chars!!',
+        'encrypt_key' => 'your-32-char-secret-key-here-at-least-32bytes!!',
         'token_lifetime_days' => 90,
     ],
     'storage' => [
         'path' => __DIR__ . '/../data/voxora.db',
     ],
     'providers' => [
-        'eleven' => [
-            'api_key' => 'sk-...',
+        'elevenlabs' => [
+            'api_key' => 'your_elevenlabs_api_key_here',
             'base_uri' => 'https://api.elevenlabs.io/v1',
         ],
         'piper' => [
             'binary' => 'piper',
             'model' => __DIR__ . '/../models/en_US-lessac-medium.onnx',
         ],
+        // Plugin system example - register your own provider at runtime:
+        // 'openai' => [
+        //     'class' => 'MyApp\\OpenAITTSProvider',
+        //     'api_key' => 'sk-...',
+        //     'model' => 'tts-1-hd',
+        // ],
     ],
     'audio' => [
         'directory' => __DIR__ . '/../storage/audio',
@@ -36,12 +36,17 @@ return [
         'normalize' => true,
         'target_loudness' => -16.0,
     ],
+    'rate_limit' => [
+        'requests' => 100,
+        'window' => 60,
+    ],
+    'redis' => [
+        'host' => '127.0.0.1',
+        'port' => 6379,
+        'password' => null,
+    ],
     'webhooks' => [
-        'enabled' => false,
-        'urls' => [
-            // 'https://your-service.example.com/webhook/voxora',
-        ],
-        'timeout' => 5,
-        'secret' => null, // HMAC-SHA256 signing secret (optional but recommended)
+        // 'url' => 'https://example.com/webhook',
+        // 'events' => ['generation.success'],
     ],
 ];
