@@ -6,6 +6,7 @@ namespace Voxora\Http;
 
 use Voxora\Security\KeyManager;
 use Voxora\Security\Token;
+use Voxora\Security\RateLimiter;
 use Voxora\TTS\Manager;
 use Voxora\TTS\WebhookDispatcher;
 use Voxora\Storage\SqliteRepository;
@@ -19,6 +20,7 @@ use DateTimeImmutable;
  * JSON-first REST API for programmatic access to TTS capabilities.
  * All endpoints (except listVoices) require a valid scoped token.
  * Returns JSON with audio URLs, metadata, or error details.
+ * Now includes Redis-backed rate limiting on protected actions.
  */
 final class ApiController
 {
@@ -27,26 +29,29 @@ final class ApiController
     private SqliteRepository $repository;
     private array $config;
     private WebhookDispatcher $webhookDispatcher;
+    private RateLimiter $rateLimiter;
 
     public function __construct(
         KeyManager $keyManager,
         Manager $ttsManager,
         SqliteRepository $repository,
         array $config,
-        WebhookDispatcher $webhookDispatcher
+        WebhookDispatcher $webhookDispatcher,
+        RateLimiter $rateLimiter
     ) {
         $this->keyManager = $keyManager;
         $this->ttsManager = $ttsManager;
         $this->repository = $repository;
         $this->config = $config;
         $this->webhookDispatcher = $webhookDispatcher;
+        $this->rateLimiter = $rateLimiter;
     }
 
     /**
      * POST /api/v1/speech
      *
      * Accepts JSON or form data with "text" and "voice_id".
-     * Validates token + scope, generates speech, persists file and metadata.
+     * Validates token + scope, enforces rate limit, generates speech, persists file and metadata.
      */
     public function speechAction(Request $request): Response
     {
@@ -56,6 +61,11 @@ final class ApiController
                 'error' => 'Unauthorized - valid token with tts:generate scope required',
                 'code' => 'invalid_token'
             ], 401);
+        }
+
+        $rateResponse = $this->checkRateLimit($token);
+        if ($rateResponse !== null) {
+            return $rateResponse;
         }
 
         $input = $this->parseInput($request);
@@ -128,6 +138,7 @@ final class ApiController
                 'role' => $token->role,
                 'normalized' => $result->metadata['normalized'] ?? false,
                 'format' => $result->format,
+                'rate_limit_remaining' => $this->rateLimiter->getRemaining('user:' . ($token->userId ?? 1)),
             ]);
         } catch (InvalidArgumentException $e) {
             return Response::json(['error' => $e->getMessage()], 400);
@@ -148,6 +159,11 @@ final class ApiController
             return Response::json(['error' => 'Unauthorized'], 401);
         }
 
+        $rateResponse = $this->checkRateLimit($token);
+        if ($rateResponse !== null) {
+            return $rateResponse;
+        }
+
         $limit = max(1, min(100, (int) ($request->getPost('limit', 20))));
         $history = $this->repository->getHistory($limit, $token->userId);
 
@@ -156,6 +172,7 @@ final class ApiController
             'count' => count($history),
             'user_id' => $token->userId,
             'role' => $token->role,
+            'rate_limit_remaining' => $this->rateLimiter->getRemaining('user:' . ($token->userId ?? 1)),
         ]);
     }
 
@@ -163,10 +180,15 @@ final class ApiController
      * POST /api/v1/tokens
      *
      * Issues a new scoped, encrypted token. For demo purposes this endpoint
-     * does not require prior authentication.
+     * does not require prior authentication but is still rate-limited by IP.
      */
     public function issueTokenAction(Request $request): Response
     {
+        $rateResponse = $this->checkRateLimitByIp();
+        if ($rateResponse !== null) {
+            return $rateResponse;
+        }
+
         $input = $this->parseInput($request);
 
         $name = trim($input['name'] ?? '');
@@ -202,7 +224,7 @@ final class ApiController
     /**
      * GET /api/v1/voices
      *
-     * Returns curated voice library (public endpoint).
+     * Returns curated voice library (public endpoint - no rate limit).
      */
     public function listVoicesAction(Request $request): Response
     {
@@ -229,6 +251,11 @@ final class ApiController
                 'error' => 'Unauthorized - valid token with tts:generate scope required',
                 'code' => 'invalid_token'
             ], 401);
+        }
+
+        $rateResponse = $this->checkRateLimit($token);
+        if ($rateResponse !== null) {
+            return $rateResponse;
         }
 
         $name = trim($request->getPost('name', ''));
@@ -262,6 +289,7 @@ final class ApiController
                 'name' => $name,
                 'provider' => 'elevenlabs',
                 'message' => 'Voice successfully cloned via provider API and persisted. Use the voice_id in synthesis requests.',
+                'rate_limit_remaining' => $this->rateLimiter->getRemaining('user:' . ($token->userId ?? 1)),
             ]);
         } catch (InvalidArgumentException $e) {
             return Response::json(['error' => $e->getMessage()], 400);
@@ -297,6 +325,37 @@ final class ApiController
         }
 
         return $token;
+    }
+
+    private function checkRateLimit(Token $token): ?Response
+    {
+        $identifier = 'user:' . ($token->userId ?? 1);
+        if (!$this->rateLimiter->isAllowed($identifier)) {
+            return Response::json([
+                'error' => 'Rate limit exceeded. Try again later.',
+                'code' => 'rate_limit_exceeded',
+                'limit' => $this->rateLimiter->getLimit(),
+                'remaining' => 0,
+                'window_seconds' => $this->rateLimiter->getWindow(),
+            ], 429);
+        }
+        return null;
+    }
+
+    private function checkRateLimitByIp(): ?Response
+    {
+        $ip = $_SERVER['REMOTE_ADDR'] ?? 'unknown';
+        $identifier = 'ip:' . $ip;
+        if (!$this->rateLimiter->isAllowed($identifier)) {
+            return Response::json([
+                'error' => 'Rate limit exceeded. Try again later.',
+                'code' => 'rate_limit_exceeded',
+                'limit' => $this->rateLimiter->getLimit(),
+                'remaining' => 0,
+                'window_seconds' => $this->rateLimiter->getWindow(),
+            ], 429);
+        }
+        return null;
     }
 
     private function parseInput(Request $request): array

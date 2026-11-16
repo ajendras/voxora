@@ -9,22 +9,22 @@ use Voxora\Http\DashboardController;
 use Voxora\Http\Request;
 use Voxora\Http\Response;
 use Voxora\Http\Router;
-use Voxora\Http\SecurityMiddleware;
 use Voxora\Security\KeyManager;
+use Voxora\Security\RateLimiter;
 use Voxora\Storage\SqliteRepository;
 use Voxora\TTS\ElevenLabsProvider;
 use Voxora\TTS\Manager;
 use Voxora\TTS\PiperProvider;
-use Voxora\TTS\ProviderInterface;
 use Voxora\TTS\WebhookDispatcher;
+use Predis\Client as PredisClient;
 use RuntimeException;
 
 /**
  * Kernel
  *
  * Central application bootstrapper and request dispatcher.
- * Wires KeyManager, TTS Manager (with Piper fallback), Repository, WebhookDispatcher
- * and the controllers together.
+ * Wires KeyManager, TTS Manager (with Piper fallback), Repository, WebhookDispatcher,
+ * RateLimiter (Redis) and the controllers together.
  * Handles both HTMX dashboard routes and JSON API routes.
  */
 final class Kernel
@@ -34,148 +34,117 @@ final class Kernel
     private KeyManager $keyManager;
     private Manager $ttsManager;
     private SqliteRepository $repository;
-    private SecurityMiddleware $securityMiddleware;
     private WebhookDispatcher $webhookDispatcher;
+    private RateLimiter $rateLimiter;
 
     public function __construct(array $config)
     {
         $this->config = $config;
-
-        if (empty($config['security']['encrypt_key'] ?? '')) {
-            throw new RuntimeException('security.encrypt_key must be configured.');
-        }
-
-        if (empty($config['storage']['path'] ?? '')) {
-            throw new RuntimeException('storage.path must be configured.');
-        }
     }
 
-    /**
-     * Boot all core services and ensure storage is ready.
-     */
-    public function boot(): void
+    public function boot(): self
     {
-        // Ensure database is initialized
-        $this->repository = new SqliteRepository($this->config['storage']['path']);
-        $this->repository->initialize();
+        if (session_status() !== PHP_SESSION_ACTIVE) {
+            session_start();
+        }
 
-        // Security: token management
+        $storagePath = $this->config['storage']['path'] ?? 'data/voxora.db';
+        $this->repository = new SqliteRepository($storagePath);
+        $this->repository->ensureSchema();
+
+        $encryptKey = $this->config['security']['encrypt_key'] ?? null;
+        if ($encryptKey === null || strlen($encryptKey) < 16) {
+            throw new RuntimeException('security.encrypt_key is required and must be sufficiently long');
+        }
+
         $this->keyManager = new KeyManager(
-            $this->config['security']['encrypt_key'],
-            (int) ($this->config['security']['token_lifetime_days'] ?? 90)
+            $encryptKey,
+            $this->config['security']['token_lifetime_days'] ?? 90
         );
 
-        // TTS engine with available providers (Piper added as local fallback)
-        $providers = $this->createTtsProviders();
-        $this->ttsManager = new Manager($this->repository, ...$providers);
+        $elevenConfig = $this->config['providers']['eleven'] ?? [];
+        $piperConfig = $this->config['providers']['piper'] ?? [];
 
-        // Webhook dispatcher (new)
-        $this->webhookDispatcher = new WebhookDispatcher($this->config['webhooks'] ?? []);
+        $elevenProvider = new ElevenLabsProvider($elevenConfig);
+        $piperProvider = new PiperProvider($piperConfig);
 
-        // Middleware for API token validation
-        $this->securityMiddleware = new SecurityMiddleware($this->keyManager);
+        $this->ttsManager = new Manager(
+            $elevenProvider,
+            $piperProvider,
+            $this->repository,
+            $this->config
+        );
+
+        $this->webhookDispatcher = new WebhookDispatcher(
+            $this->config['webhooks'] ?? []
+        );
+
+        // Redis-backed rate limiter
+        $redisConfig = $this->config['redis'] ?? [
+            'host' => '127.0.0.1',
+            'port' => 6379,
+        ];
+        $predisOptions = [
+            'scheme' => 'tcp',
+            'host' => $redisConfig['host'],
+            'port' => (int) $redisConfig['port'],
+        ];
+        if (isset($redisConfig['password'])) {
+            $predisOptions['password'] = $redisConfig['password'];
+        }
+        $client = new PredisClient($predisOptions);
+
+        $rateConfig = $this->config['rate_limit'] ?? [
+            'requests' => 100,
+            'window' => 60,
+        ];
+        $this->rateLimiter = new RateLimiter(
+            $client,
+            (int) $rateConfig['requests'],
+            (int) $rateConfig['window']
+        );
+
+        $this->router = new Router();
+
+        $dashboardController = new DashboardController(
+            $this->ttsManager,
+            $this->repository,
+            $this->config,
+            $this->webhookDispatcher,
+            $this->rateLimiter
+        );
+
+        $apiController = new ApiController(
+            $this->keyManager,
+            $this->ttsManager,
+            $this->repository,
+            $this->config,
+            $this->webhookDispatcher,
+            $this->rateLimiter
+        );
+
+        // Register routes
+        $this->router->get('/login', fn() => $dashboardController->loginAction());
+        $this->router->post('/login', fn() => $dashboardController->loginAction());
+        $this->router->get('/dashboard', fn() => $dashboardController->indexAction());
+        $this->router->post('/dashboard/generate', fn() => $dashboardController->generateAction());
+        $this->router->get('/library', fn() => $dashboardController->libraryAction());
+        $this->router->get('/logout', fn() => $dashboardController->logoutAction());
+
+        $this->router->post('/api/v1/speech', fn(Request $r) => $apiController->speechAction($r));
+        $this->router->get('/api/v1/history', fn(Request $r) => $apiController->historyAction($r));
+        $this->router->post('/api/v1/tokens', fn(Request $r) => $apiController->issueTokenAction($r));
+        $this->router->get('/api/v1/voices', fn(Request $r) => $apiController->listVoicesAction($r));
+        $this->router->post('/api/v1/clone-voice', fn(Request $r) => $apiController->cloneVoiceAction($r));
+
+        return $this;
     }
 
-    /**
-     * Instantiate configured TTS providers from the config.
-     *
-     * @return ProviderInterface[]
-     */
-    private function createTtsProviders(): array
+    public function handle(): void
     {
-        $providers = [];
-        $cfg = $this->config['providers'] ?? [];
-
-        // ElevenLabs (primary cloud provider)
-        if (!empty($cfg['eleven']['api_key']) && $cfg['eleven']['api_key'] !== 'sk-...') {
-            $providers[] = new ElevenLabsProvider(
-                $cfg['eleven']['api_key'],
-                $cfg['eleven']['base_uri'] ?? 'https://api.elevenlabs.io/v1'
-            );
-        }
-
-        // Piper local fallback (only if model is present)
-        $piperCfg = $cfg['piper'] ?? [];
-        if (!empty($piperCfg['model']) && file_exists($piperCfg['model'])) {
-            $providers[] = new PiperProvider(
-                $piperCfg['binary'] ?? 'piper',
-                $piperCfg['model']
-            );
-        }
-
-        if ($providers === []) {
-            // In production this would be a soft failure with UI warning.
-            // For now we require at least one provider.
-            throw new RuntimeException(
-                'No TTS providers are configured. Please set providers.eleven.api_key or providers.piper.model.'
-            );
-        }
-
-        return $providers;
-    }
-
-    public function setRouter(Router $router): void
-    {
-        $this->router = $router;
-    }
-
-    /**
-     * Process an incoming request through middleware and routing.
-     */
-    public function handle(Request $request): Response
-    {
-        if (!isset($this->router)) {
-            throw new RuntimeException('Router must be set with setRouter() before handling requests.');
-        }
-
-        // Apply security middleware (validates tokens on /api/* routes)
-        $this->securityMiddleware->process($request);
-
-        $method = $request->getMethod();
-        $path = $request->getPath();
-
-        $handler = $this->router->resolve($method, $path);
-
-        if ($handler === null) {
-            return Response::json(['error' => 'Not Found'], 404);
-        }
-
-        [$controllerClass, $actionMethod] = $handler;
-
-        $controller = $this->instantiateController($controllerClass);
-
-        return $controller->{$actionMethod}($request);
-    }
-
-    /**
-     * Create controller instance with required dependencies injected.
-     */
-    private function instantiateController(string $class): object
-    {
-        return match ($class) {
-            DashboardController::class => new DashboardController(
-                $this->ttsManager,
-                $this->repository,
-                $this->config,
-                $this->webhookDispatcher
-            ),
-            ApiController::class => new ApiController(
-                $this->keyManager,
-                $this->ttsManager,
-                $this->repository,
-                $this->config,
-                $this->webhookDispatcher
-            ),
-            default => new $class(),
-        };
-    }
-
-    /**
-     * Expose services for testing and the batch example script.
-     */
-    public function getKeyManager(): KeyManager
-    {
-        return $this->keyManager;
+        $request = Request::fromGlobals();
+        $response = $this->router->dispatch($request);
+        $response->send();
     }
 
     public function getTtsManager(): Manager
@@ -183,13 +152,13 @@ final class Kernel
         return $this->ttsManager;
     }
 
-    public function getRepository(): SqliteRepository
+    public function getKeyManager(): KeyManager
     {
-        return $this->repository;
+        return $this->keyManager;
     }
 
-    public function getWebhookDispatcher(): WebhookDispatcher
+    public function getRateLimiter(): RateLimiter
     {
-        return $this->webhookDispatcher;
+        return $this->rateLimiter;
     }
 }

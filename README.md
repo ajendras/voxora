@@ -30,6 +30,7 @@ Developers integrating high-quality voices face fragmented provider APIs, expose
 - **Local fallback** — Seamless offline synthesis via Piper when cloud providers are unavailable.
 - **Voice cloning** — Upload audio samples directly to provider APIs (`Manager::cloneVoice()`) with results persisted as reusable custom voices.
 - **Audio post-processing** — FFmpeg integration for loudness normalization (EBU R128 loudnorm), peak limiting, format conversion (MP3/WAV) and duration measurement.
+- **Production ready** — Redis-backed rate limiter prevents abuse with per-user/token throttling (fails open on Redis outage).
 
 ## 🎬 Demo
 
@@ -92,6 +93,12 @@ Upload sample audio via <code>/api/v1/clone-voice</code> or Library UI; <code>Ma
 FFmpeg integration for normalization, loudness (loudnorm filter targeting LUFS), format conversion (MP3/WAV) and automatic duration extraction — available on every <code>SynthesisResult</code>
 </td>
 </tr>
+<tr>
+<td valign="top" colspan="3">
+🚦 <b>Rate Limiter</b><br>
+Redis-backed request throttling (<code>RateLimiter</code>) with configurable per-user/token windows; returns 429 on exceed, fails-open on Redis outage
+</td>
+</tr>
 </table>
 
 ## 📦 Installation
@@ -102,6 +109,7 @@ FFmpeg integration for normalization, loudness (loudnorm filter targeting LUFS),
 - Composer
 - (Optional) Piper binary + voice model for local fallback
 - (Optional) FFmpeg CLI for normalization & format conversion
+- (Optional but recommended) Redis for rate limiting
 
 ```bash
 composer create-project ajendras/voxora voxora-app
@@ -252,6 +260,28 @@ echo "Token: $token\n";
 
 Use the token in the `Authorization: Bearer` header or `X-Api-Key` for `/api/v1/speech`. The `Token` object now exposes `role` and `userId` for role-based decisions.
 
+### Rate limiting & throttling
+
+All protected API endpoints and dashboard synthesis are guarded by `RateLimiter` (Redis-backed fixed-window counter).
+
+- Default policy: **100 requests per 60 seconds** per user/token (configurable).
+- Exceeding the limit returns HTTP **429** (API) or a friendly error box (dashboard).
+- Identifier is derived from `user_id` (session or token). Public endpoints (e.g. `/voices`) are limited by IP.
+- If Redis is unreachable the limiter fails open (requests are allowed) to avoid blocking legitimate traffic.
+- Remaining quota is returned in API error responses.
+
+Example response on limit breach:
+
+```json
+{
+  "error": "Rate limit exceeded. Try again later.",
+  "code": "rate_limit_exceeded",
+  "limit": 100,
+  "remaining": 0,
+  "window_seconds": 60
+}
+```
+
 ### Batch processing from CSV
 
 CSV columns (case-insensitive): text, voice_id (or voice), provider, filename, format (mp3/wav), normalize (true/false).
@@ -320,6 +350,11 @@ All analytics queries are powered by the expanded `SqliteRepository::getUsageSta
 | `ffmpeg.binary`               | `ffmpeg`              | Path to FFmpeg binary (used by SynthesisResult::process()) |
 | `ffmpeg.normalize`            | true                  | Whether to run loudnorm filter by default |
 | `ffmpeg.target_loudness`      | -16.0                 | Target LUFS value for normalization |
+| `rate_limit.requests`         | 100                   | Maximum requests allowed in each window (per user/token) |
+| `rate_limit.window`           | 60                    | Window size in seconds for the rate limit counter |
+| `redis.host`                  | 127.0.0.1             | Redis server hostname |
+| `redis.port`                  | 6379                  | Redis server port |
+| `redis.password`              | null                  | Optional Redis AUTH password |
 
 All values are defined in `config/app.php` and loaded by `Kernel`.
 
@@ -331,8 +366,12 @@ flowchart TD
     Index --> Kernel[Kernel::boot + handle]
     Kernel --> Session[session_start + Auth]
     Kernel --> Router[Router]
+    Kernel --> Redis[Predis Client]
+    Kernel --> RateLimiter[RateLimiter (Redis incr/expire)]
     Router --> Dashboard[DashboardController<br>(login, index, generate)]
     Router --> Api[ApiController<br>(cloneVoiceAction)]
+    Api --> RateLimiter
+    Dashboard --> RateLimiter
     Api --> KeyManager[KeyManager::validate<br>(role + userId)]
     Api --> Manager[TTS\Manager::generate or cloneVoice]
     Dashboard --> Manager
@@ -352,7 +391,7 @@ flowchart TD
     Dashboard --> Analytics
 ```
 
-`Kernel` wires together `KeyManager`, `TTS\Manager`, `SqliteRepository` and the two controllers. All synthesis paths converge on `Manager::generate()`, which selects a `ProviderInterface` implementation, caches results and records usage. The dashboard uses HTMX fragments while the API returns JSON with public audio URLs. Sessions + `users` table enable multi-user isolation and role checks (`admin` vs `user`). Piper is used as automatic fallback for offline/resilient operation. Voice cloning is handled by `Manager::cloneVoice()` which delegates to the provider, stores the voice, and makes it available in `listLibrary()`. The new SSML editor lives inside `DashboardController::renderSynthPanel()` with pure-JS tag insertion that feeds directly into the existing HTMX generation flow. **FFmpeg integration lives in `SynthesisResult::process()`** and is invoked automatically by `Manager`. The analytics dashboard is rendered server-side with Chart.js consuming JSON data produced by `SqliteRepository::getUsageStats()` (including automatic date-gap filling).
+`Kernel` wires together `KeyManager`, `TTS\Manager`, `SqliteRepository` and the two controllers. All synthesis paths converge on `Manager::generate()`, which selects a `ProviderInterface` implementation, caches results and records usage. The dashboard uses HTMX fragments while the API returns JSON with public audio URLs. Sessions + `users` table enable multi-user isolation and role checks (`admin` vs `user`). Piper is used as automatic fallback for offline/resilient operation. Voice cloning is handled by `Manager::cloneVoice()` which delegates to the provider, stores the voice, and makes it available in `listLibrary()`. The new SSML editor lives inside `DashboardController::renderSynthPanel()` with pure-JS tag insertion that feeds directly into the existing HTMX generation flow. **FFmpeg integration lives in `SynthesisResult::process()`** and is invoked automatically by `Manager`. The analytics dashboard is rendered server-side with Chart.js consuming JSON data produced by `SqliteRepository::getUsageStats()` (including automatic date-gap filling). **RateLimiter** sits in front of protected actions and uses Redis counters (per-user or per-IP) to enforce throttling.
 
 ## 📁 Project structure
 
@@ -397,7 +436,7 @@ vendor/bin/phpunit
 
 PHPUnit is configured via `phpunit.xml.dist` (disables the result cache to avoid "Could not write test results to cache file" errors in CI environments such as the PHP 8.2 job).
 
-The test suite covers `KeyManager` token issuance, validation, expiry checks, encryption round-trips, scope enforcement and the new role/userId fields. New unit tests validate Piper WAV duration parsing and fallback paths. `PiperProviderTest` now also asserts that `cloneVoice()` throws the expected exception and that `SynthesisResult::process()` correctly handles normalization and format conversion (with graceful degradation when FFmpeg is unavailable).
+The test suite covers `KeyManager` token issuance, validation, expiry checks, encryption round-trips, scope enforcement and the new role/userId fields. New unit tests validate Piper WAV duration parsing and fallback paths. `PiperProviderTest` now also asserts that `cloneVoice()` throws the expected exception and that `SynthesisResult::process()` correctly handles normalization and format conversion (with graceful degradation when FFmpeg is unavailable). RateLimiter behavior (allowed/blocked windows, mock Redis interactions) is covered inside `KeyManagerTest`.
 
 ## 📍 Roadmap
 
@@ -410,7 +449,7 @@ The test suite covers `KeyManager` token issuance, validation, expiry checks, en
 - [x] FFmpeg integration for normalization, loudness and format conversion
 - [x] Interactive usage analytics dashboard with Chart.js charts
 - [x] Configurable webhooks on successful generation
-- [ ] Redis-backed rate limiter and request throttling
+- [x] Redis-backed rate limiter and request throttling
 - [ ] Plugin system for registering new TTS providers at runtime
 - [ ] Scheduled batch jobs using native cron expressions
 - [ ] Dark/light mode persistence and improved accessibility
