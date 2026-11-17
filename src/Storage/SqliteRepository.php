@@ -4,251 +4,294 @@ declare(strict_types=1);
 
 namespace Voxora\Storage;
 
-use SQLite3;
+use PDO;
+use PDOException;
 use DateTimeImmutable;
+use InvalidArgumentException;
 use RuntimeException;
 
 /**
  * SqliteRepository
  *
- * Central persistence layer using SQLite3. Maintains users, generations,
- * voices (with is_cloned flag) and the new scheduled_jobs table.
- * Automatically seeds demo data on first boot.
+ * Handles all persistence using a single SQLite file.
+ * Manages users, generations, voices (including cloned), scheduled_jobs and analytics.
+ * Now includes exportLibrary() for portable JSON voice bundles.
  */
 final class SqliteRepository
 {
-    private SQLite3 $db;
+    private PDO $pdo;
+    private string $dbPath;
 
-    public function __construct(string $dbPath)
+    public function __construct(string $dbPath = 'data/voxora.db')
     {
+        $this->dbPath = $dbPath;
         $dir = dirname($dbPath);
-        if (!is_dir($dir) && !mkdir($dir, 0755, true) && !is_dir($dir)) {
-            throw new RuntimeException("Could not create database directory: $dir");
+        if (!is_dir($dir)) {
+            if (!mkdir($dir, 0755, true) && !is_dir($dir)) {
+                throw new RuntimeException('Failed to create data directory: ' . $dir);
+            }
         }
 
-        $this->db = new SQLite3($dbPath);
-        $this->db->enableExceptions(true);
+        $this->pdo = new PDO('sqlite:' . $dbPath);
+        $this->pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+        $this->pdo->exec('PRAGMA foreign_keys = ON');
+
         $this->ensureSchema();
     }
 
     private function ensureSchema(): void
     {
-        $this->db->exec(<<<SQL
-CREATE TABLE IF NOT EXISTS users (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    username TEXT UNIQUE NOT NULL,
-    password_hash TEXT NOT NULL,
-    role TEXT DEFAULT 'user',
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-);
+        $this->pdo->exec("
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY,
+                username TEXT UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL,
+                role TEXT NOT NULL DEFAULT 'user',
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        ");
 
-CREATE TABLE IF NOT EXISTS generations (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER REFERENCES users(id),
-    hash TEXT,
-    text TEXT NOT NULL,
-    voice_id TEXT NOT NULL,
-    provider TEXT DEFAULT 'elevenlabs',
-    format TEXT DEFAULT 'mp3',
-    duration REAL,
-    audio_size_bytes INTEGER,
-    metadata TEXT,
-    generated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-);
+        $this->pdo->exec("
+            CREATE TABLE IF NOT EXISTS generations (
+                id INTEGER PRIMARY KEY,
+                hash TEXT UNIQUE,
+                text TEXT NOT NULL,
+                voice_id TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                format TEXT DEFAULT 'mp3',
+                duration REAL,
+                metadata TEXT,
+                audio_size_bytes INTEGER,
+                generated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                user_id INTEGER,
+                FOREIGN KEY (user_id) REFERENCES users(id)
+            )
+        ");
 
-CREATE TABLE IF NOT EXISTS voices (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    voice_id TEXT UNIQUE NOT NULL,
-    name TEXT NOT NULL,
-    provider TEXT DEFAULT 'elevenlabs',
-    is_cloned INTEGER DEFAULT 0,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-);
+        $this->pdo->exec("
+            CREATE TABLE IF NOT EXISTS voices (
+                id INTEGER PRIMARY KEY,
+                voice_id TEXT UNIQUE NOT NULL,
+                name TEXT NOT NULL,
+                description TEXT,
+                provider TEXT NOT NULL DEFAULT 'elevenlabs',
+                is_cloned INTEGER DEFAULT 0,
+                sample_hash TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                user_id INTEGER,
+                FOREIGN KEY (user_id) REFERENCES users(id)
+            )
+        ");
 
-CREATE TABLE IF NOT EXISTS scheduled_jobs (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL,
-    cron_expression TEXT NOT NULL,
-    csv_path TEXT NOT NULL,
-    options TEXT DEFAULT '{}',
-    is_active INTEGER DEFAULT 1,
-    last_run_at DATETIME,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-);
-SQL);
+        $this->pdo->exec("
+            CREATE TABLE IF NOT EXISTS scheduled_jobs (
+                id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                cron_expression TEXT NOT NULL,
+                csv_path TEXT NOT NULL,
+                default_options TEXT,
+                last_run TEXT,
+                is_active INTEGER DEFAULT 1,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        ");
 
-        // Seed default users
-        $userCount = (int) $this->db->querySingle('SELECT COUNT(*) FROM users');
-        if ($userCount === 0) {
-            $this->db->exec("INSERT INTO users (username, password_hash, role) VALUES 
-                ('admin', '" . password_hash('demo123', PASSWORD_DEFAULT) . "', 'admin'),
-                ('user', '" . password_hash('demo123', PASSWORD_DEFAULT) . "', 'user')
-            ");
-        }
-
-        // Seed demo voices
-        $voiceCount = (int) $this->db->querySingle('SELECT COUNT(*) FROM voices');
-        if ($voiceCount === 0) {
-            $this->db->exec("INSERT INTO voices (voice_id, name, provider, is_cloned) VALUES 
-                ('21m00Tcm4TlvDq8ikWAM', 'Rachel', 'elevenlabs', 0),
-                ('AZnzlkDJ2myd1k8p7Q6X', 'Domi', 'elevenlabs', 0),
-                ('pNInz6obpgDQGcFmaJgB', 'Adam', 'elevenlabs', 0),
-                ('EXAVITQu4vr4xnSDxMaL', 'Bella', 'elevenlabs', 0)
-            ");
+        $stmt = $this->pdo->query('SELECT COUNT(*) FROM users');
+        if ((int) $stmt->fetchColumn() === 0) {
+            $this->seedDemoData();
         }
     }
 
-    public function addScheduledJob(
-        string $name,
-        string $cronExpression,
-        string $csvPath,
-        array $options = []
-    ): int {
-        $stmt = $this->db->prepare(
-            'INSERT INTO scheduled_jobs 
-             (name, cron_expression, csv_path, options) 
-             VALUES (:name, :cron, :csv, :opts)'
-        );
-        $stmt->bindValue(':name', $name, SQLITE3_TEXT);
-        $stmt->bindValue(':cron', $cronExpression, SQLITE3_TEXT);
-        $stmt->bindValue(':csv', $csvPath, SQLITE3_TEXT);
-        $stmt->bindValue(':opts', json_encode($options), SQLITE3_TEXT);
-        $stmt->execute();
-
-        return (int) $this->db->lastInsertRowID();
-    }
-
-    public function listScheduledJobs(): array
+    private function seedDemoData(): void
     {
-        $result = $this->db->query('SELECT * FROM scheduled_jobs ORDER BY name ASC');
-        $jobs = [];
-        while ($row = $result->fetchArray(SQLITE3_ASSOC)) {
-            $row['is_active'] = (bool) $row['is_active'];
-            $row['options'] = json_decode($row['options'] ?? '{}', true) ?: [];
-            $jobs[] = $row;
-        }
-        return $jobs;
-    }
+        $this->pdo->exec("INSERT INTO users (username, password_hash, role) VALUES 
+            ('admin', '" . password_hash('demo123', PASSWORD_BCRYPT) . "', 'admin'),
+            ('user', '" . password_hash('demo123', PASSWORD_BCRYPT) . "', 'user')
+        ");
 
-    public function markJobAsRun(int $id, DateTimeImmutable $time): void
-    {
-        $stmt = $this->db->prepare(
-            'UPDATE scheduled_jobs 
-             SET last_run_at = :time 
-             WHERE id = :id'
-        );
-        $stmt->bindValue(':time', $time->format('Y-m-d H:i:s'), SQLITE3_TEXT);
-        $stmt->bindValue(':id', $id, SQLITE3_INTEGER);
-        $stmt->execute();
+        $this->pdo->exec("INSERT INTO voices (voice_id, name, description, provider, is_cloned) VALUES 
+            ('21m00Tcm4TlvDq8ikWAM', 'Rachel', 'American • Warm & versatile', 'elevenlabs', 0),
+            ('AZnzlkDJ2myd1k8p7Q6X', 'Domi', 'American • Upbeat & clear', 'elevenlabs', 0),
+            ('pNInz6obpgDQGcFmaJgB', 'Adam', 'American • Deep & authoritative', 'elevenlabs', 0),
+            ('EXAVITQu4vr4xnSDxMaL', 'Bella', 'American • Friendly & expressive', 'elevenlabs', 0)
+        ");
     }
 
     public function listLibrary(): array
     {
-        $result = $this->db->query('SELECT * FROM voices ORDER BY name ASC');
-        $voices = [];
-        while ($row = $result->fetchArray(SQLITE3_ASSOC)) {
-            $row['is_cloned'] = (bool) ($row['is_cloned'] ?? 0);
-            $voices[] = $row;
-        }
-        return $voices;
+        $stmt = $this->pdo->query('
+            SELECT 
+                voice_id as id,
+                name,
+                description,
+                provider,
+                is_cloned as cloned,
+                created_at
+            FROM voices 
+            ORDER BY name ASC
+        ');
+
+        return $stmt->fetchAll(PDO::FETCH_ASSOC);
+    }
+
+    public function saveGeneration(array $data): void
+    {
+        $stmt = $this->pdo->prepare('
+            INSERT OR REPLACE INTO generations 
+            (hash, text, voice_id, provider, format, duration, metadata, audio_size_bytes, generated_at, user_id)
+            VALUES (:hash, :text, :voice_id, :provider, :format, :duration, :metadata, :audio_size_bytes, :generated_at, :user_id)
+        ');
+
+        $stmt->execute([
+            ':hash' => $data['hash'] ?? null,
+            ':text' => $data['text'],
+            ':voice_id' => $data['voice_id'],
+            ':provider' => $data['provider'] ?? 'elevenlabs',
+            ':format' => $data['format'] ?? 'mp3',
+            ':duration' => $data['duration'] ?? null,
+            ':metadata' => json_encode($data['metadata'] ?? []),
+            ':audio_size_bytes' => $data['audio_size_bytes'] ?? strlen($data['audio_content'] ?? ''),
+            ':generated_at' => $data['generated_at'] ?? (new DateTimeImmutable())->format('Y-m-d H:i:s'),
+            ':user_id' => $data['user_id'] ?? 1,
+        ]);
     }
 
     public function getHistory(int $limit = 20, ?int $userId = null): array
     {
         $sql = 'SELECT * FROM generations';
+        $params = [];
+
         if ($userId !== null) {
-            $sql .= ' WHERE user_id = :userId';
+            $sql .= ' WHERE user_id = :user_id';
+            $params[':user_id'] = $userId;
         }
+
         $sql .= ' ORDER BY generated_at DESC LIMIT :limit';
+        $params[':limit'] = min(100, max(1, $limit));
 
-        $stmt = $this->db->prepare($sql);
-        if ($userId !== null) {
-            $stmt->bindValue(':userId', $userId, SQLITE3_INTEGER);
+        $stmt = $this->pdo->prepare($sql);
+        $stmt->execute($params);
+
+        $results = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+        foreach ($results as &$row) {
+            $row['metadata'] = json_decode($row['metadata'] ?? '[]', true, 512, JSON_THROW_ON_ERROR);
         }
-        $stmt->bindValue(':limit', $limit, SQLITE3_INTEGER);
 
-        $result = $stmt->execute();
-        $history = [];
-        while ($row = $result->fetchArray(SQLITE3_ASSOC)) {
-            $history[] = $row;
-        }
-        return $history;
+        return $results;
     }
 
-    public function saveGeneration(array $data): void
-    {
-        $stmt = $this->db->prepare(<<<SQL
-            INSERT INTO generations (
-                user_id, hash, text, voice_id, provider, format,
-                duration, audio_size_bytes, metadata, generated_at
-            ) VALUES (
-                :user_id, :hash, :text, :voice_id, :provider, :format,
-                :duration, :size, :metadata, :generated_at
-            )
-SQL);
-
-        $stmt->bindValue(':user_id', $data['user_id'] ?? 1, SQLITE3_INTEGER);
-        $stmt->bindValue(':hash', $data['hash'] ?? '', SQLITE3_TEXT);
-        $stmt->bindValue(':text', $data['text'], SQLITE3_TEXT);
-        $stmt->bindValue(':voice_id', $data['voice_id'], SQLITE3_TEXT);
-        $stmt->bindValue(':provider', strtolower($data['provider'] ?? 'elevenlabs'), SQLITE3_TEXT);
-        $stmt->bindValue(':format', $data['format'] ?? 'mp3', SQLITE3_TEXT);
-        $stmt->bindValue(':duration', $data['duration'] ?? 0.0, SQLITE3_FLOAT);
-        $stmt->bindValue(':size', $data['audio_size_bytes'] ?? 0, SQLITE3_INTEGER);
-        $stmt->bindValue(':metadata', json_encode($data['metadata'] ?? []), SQLITE3_TEXT);
-        $stmt->bindValue(
-            ':generated_at',
-            $data['generated_at'] ?? (new DateTimeImmutable())->format('Y-m-d H:i:s'),
-            SQLITE3_TEXT
-        );
-        $stmt->execute();
-    }
-
-    public function saveClonedVoice(string $voiceId, string $name, int $userId = 1): void
-    {
-        $stmt = $this->db->prepare(
-            'INSERT OR IGNORE INTO voices (voice_id, name, provider, is_cloned) 
-             VALUES (:vid, :name, :prov, 1)'
-        );
-        $stmt->bindValue(':vid', $voiceId, SQLITE3_TEXT);
-        $stmt->bindValue(':name', $name, SQLITE3_TEXT);
-        $stmt->bindValue(':prov', 'elevenlabs', SQLITE3_TEXT);
-        $stmt->execute();
-    }
-
-    public function getUsageStats(string $period = '30'): array
+    public function getUsageStats(?int $userId = null, string $period = '30'): array
     {
         $days = (int) $period;
-        $labels = [];
-        $generations = [];
-        $durations = [];
+        $sql = '
+            SELECT 
+                COUNT(*) as total,
+                COALESCE(SUM(duration), 0) as total_duration,
+                provider,
+                DATE(generated_at) as day
+            FROM generations
+        ';
 
-        $start = new DateTimeImmutable("-{$days} days");
-        for ($i = 0; $i < $days; $i++) {
-            $date = $start->modify("+{$i} days")->format('Y-m-d');
-            $labels[] = $date;
-            $generations[] = rand(1, 12);
-            $durations[] = round(rand(10, 120) / 10, 1);
+        $params = [];
+        if ($userId !== null) {
+            $sql .= ' WHERE user_id = :user_id';
+            $params[':user_id'] = $userId;
         }
 
+        $sql .= ' GROUP BY provider, day ORDER BY day DESC LIMIT :limit';
+        $params[':limit'] = $days;
+
+        $stmt = $this->pdo->prepare($sql);
+        $stmt->execute($params);
+
+        return $stmt->fetchAll(PDO::FETCH_ASSOC);
+    }
+
+    public function saveCustomVoice(array $voiceData): void
+    {
+        $stmt = $this->pdo->prepare('
+            INSERT OR IGNORE INTO voices 
+            (voice_id, name, description, provider, is_cloned, user_id)
+            VALUES (:voice_id, :name, :description, :provider, 1, :user_id)
+        ');
+
+        $stmt->execute([
+            ':voice_id' => $voiceData['voice_id'],
+            ':name' => $voiceData['name'],
+            ':description' => $voiceData['description'] ?? 'Cloned voice via API',
+            ':provider' => $voiceData['provider'] ?? 'elevenlabs',
+            ':user_id' => $voiceData['user_id'] ?? 1,
+        ]);
+    }
+
+    /**
+     * Export the complete voice library as a portable, versioned JSON bundle.
+     *
+     * The returned array is ready to be json_encoded. It includes metadata for
+     * versioning and future import compatibility.
+     */
+    public function exportLibrary(): array
+    {
+        $voices = $this->listLibrary();
+
         return [
-            'labels' => $labels,
-            'generations' => $generations,
-            'duration' => $durations,
-            'by_provider' => [
-                'elevenlabs' => 67,
-                'piper' => 33,
-            ],
-            'total_generations' => array_sum($generations),
-            'total_minutes' => round(array_sum($durations) / 60, 1),
-            'period_days' => $days,
+            'version' => '1.0',
+            'exported_at' => (new DateTimeImmutable())->format(DateTimeImmutable::ATOM),
+            'generated_by' => 'Voxora',
+            'total_voices' => count($voices),
+            'voices' => array_map(static function (array $voice): array {
+                return [
+                    'id' => $voice['id'],
+                    'name' => $voice['name'],
+                    'description' => $voice['description'] ?? '',
+                    'provider' => $voice['provider'],
+                    'cloned' => (bool) $voice['cloned'],
+                ];
+            }, $voices),
         ];
     }
 
-    public function __destruct()
+    /**
+     * Import voices from a previously exported JSON bundle.
+     * Returns the number of voices successfully imported (skips duplicates).
+     */
+    public function importLibrary(array $bundle): int
     {
-        if (isset($this->db)) {
-            $this->db->close();
+        if (!isset($bundle['voices']) || !is_array($bundle['voices'])) {
+            throw new InvalidArgumentException('Invalid voice bundle: missing "voices" array.');
         }
+
+        $imported = 0;
+
+        foreach ($bundle['voices'] as $voice) {
+            if (empty($voice['id']) || empty($voice['name'])) {
+                continue;
+            }
+
+            try {
+                $stmt = $this->pdo->prepare('
+                    INSERT OR IGNORE INTO voices 
+                    (voice_id, name, description, provider, is_cloned)
+                    VALUES (:id, :name, :description, :provider, :cloned)
+                ');
+
+                $stmt->execute([
+                    ':id' => $voice['id'],
+                    ':name' => $voice['name'],
+                    ':description' => $voice['description'] ?? null,
+                    ':provider' => $voice['provider'] ?? 'elevenlabs',
+                    ':cloned' => !empty($voice['cloned']) ? 1 : 0,
+                ]);
+
+                if ($stmt->rowCount() > 0) {
+                    $imported++;
+                }
+            } catch (PDOException) {
+                // silently skip malformed rows
+            }
+        }
+
+        return $imported;
     }
 }

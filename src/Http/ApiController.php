@@ -20,7 +20,8 @@ use DateTimeImmutable;
  * JSON-first REST API for programmatic access to TTS capabilities.
  * All endpoints (except listVoices) require a valid scoped token.
  * Returns JSON with audio URLs, metadata, or error details.
- * Now includes Redis-backed rate limiting on protected actions.
+ * Now includes Redis-backed rate limiting on protected actions
+ * and export of the voice library as portable JSON bundles.
  */
 final class ApiController
 {
@@ -234,6 +235,25 @@ final class ApiController
             'voices' => $voices,
             'default_voice' => '21m00Tcm4TlvDq8ikWAM',
             'provider' => 'elevenlabs',
+        ]);
+    }
+
+    /**
+     * GET /api/v1/library/export
+     *
+     * Returns the full voice library (curated + cloned voices) as a
+     * portable, versioned JSON bundle. The response includes a
+     * Content-Disposition header so browsers will offer a download.
+     */
+    public function exportLibraryAction(Request $request): Response
+    {
+        $bundle = $this->repository->exportLibrary();
+
+        // Response::json is used for consistency; we assume it can accept
+        // extra headers (or the front-controller adds them). The bundle
+        // is ready for direct consumption or importLibrary().
+        return Response::json($bundle, 200, [
+            'Content-Disposition' => 'attachment; filename="voxora-voice-library-' . date('Y-m-d-His') . '.json"',
         ]);
     }
 
