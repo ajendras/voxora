@@ -1,31 +1,24 @@
 <?php
 
-// Configuration for Voxora.
-// Copy this file to config/app.php and fill in your credentials.
+declare(strict_types=1);
 
 return [
     'security' => [
-        'encrypt_key' => 'your-32-char-secret-key-here-at-least-32bytes!!',
+        'encrypt_key' => 'change-this-to-a-32-byte-random-hex-string-in-production',
         'token_lifetime_days' => 90,
     ],
     'storage' => [
         'path' => __DIR__ . '/../data/voxora.db',
     ],
     'providers' => [
-        'elevenlabs' => [
-            'api_key' => 'your_elevenlabs_api_key_here',
+        'eleven' => [
+            'api_key' => getenv('ELEVENLABS_API_KEY') ?: 'demo-key-replace-in-production',
             'base_uri' => 'https://api.elevenlabs.io/v1',
         ],
         'piper' => [
             'binary' => 'piper',
             'model' => __DIR__ . '/../models/en_US-lessac-medium.onnx',
         ],
-        // Plugin system example - register your own provider at runtime:
-        // 'openai' => [
-        //     'class' => 'MyApp\\OpenAITTSProvider',
-        //     'api_key' => 'sk-...',
-        //     'model' => 'tts-1-hd',
-        // ],
     ],
     'audio' => [
         'directory' => __DIR__ . '/../storage/audio',
@@ -45,8 +38,15 @@ return [
         'port' => 6379,
         'password' => null,
     ],
+    'scheduler' => [
+        'log' => __DIR__ . '/../data/scheduler.log',
+    ],
+    'ui' => [
+        'default_theme' => 'system',
+    ],
     'webhooks' => [
-        // 'url' => 'https://example.com/webhook',
-        // 'events' => ['generation.success'],
+        'enabled' => false,
+        'url' => null,
+        'secret' => null,
     ],
 ];

@@ -33,6 +33,7 @@ Developers integrating high-quality voices face fragmented provider APIs, expose
 - **Production ready** — Redis-backed rate limiter prevents abuse with per-user/token throttling (fails open on Redis outage).
 - **Plugin system** — Register new TTS providers at runtime with `Manager::registerProvider()`; they are automatically available in the dashboard, API, batch jobs and analytics.
 - **Scheduled Batch Jobs** — Define recurring CSV synthesis with native cron expressions (`0 9 * * *`). `Scheduler::runDue()` is safe to invoke every minute from system cron; jobs and last-run state are persisted in SQLite.
+- **Theme & Accessibility** — Automatic dark/light mode with localStorage persistence, comprehensive ARIA support, semantic structure, keyboard navigation and live regions for screen reader compatibility.
 
 ## 🎬 Demo
 
@@ -111,6 +112,12 @@ Register new TTS providers at runtime with <code>Manager::registerProvider('mypr
 <td valign="top" colspan="3">
 ⏰ <b>Scheduled Batch Jobs</b><br>
 <code>Scheduler</code> + lightweight <code>CronExpression</code> parser. Persisted jobs, last-run deduplication, system-cron friendly (<code>* * * * *</code>).
+</td>
+</tr>
+<tr>
+<td valign="top" colspan="3">
+🌗 <b>Theme Engine</b><br>
+Dark and light mode with localStorage persistence, Tailwind dark variants, full accessibility (ARIA, landmarks, focus management, reduced-motion)
 </td>
 </tr>
 </table>
@@ -442,6 +449,20 @@ After login visit **/dashboard**. The page now includes a full **Usage Analytics
 
 All analytics queries are powered by the expanded `SqliteRepository::getUsageStats()` which returns ready-to-chart data including filled date gaps.
 
+### Dark / Light Mode
+
+Click the moon/sun icon in the top-right navigation bar of the dashboard to toggle between light and dark themes. The user's preference is persisted in the browser's `localStorage` (`voxora-theme` key) and restored automatically on future visits. If no preference is saved the UI respects the operating system's `prefers-color-scheme`. 
+
+The entire interface (including login, synthesis panel, analytics charts and HTMX fragments) uses Tailwind's `dark:` variant system with carefully chosen background, text and border colors that maintain excellent contrast in both modes. 
+
+Accessibility improvements include:
+- Semantic HTML landmarks (`<main role="main">`, headings, labels)
+- ARIA attributes on all interactive elements (`aria-label`, `aria-live`, `role="switch"`)
+- Visible `:focus-visible` rings using indigo accents
+- Reduced-motion support via `@media (prefers-reduced-motion)`
+- Screen-reader friendly live region that announces theme changes
+- Keyboard-navigable SSML toolbar and all forms
+
 ## 🔧 Configuration
 
 | Option                        | Default               | Description |
@@ -465,6 +486,7 @@ All analytics queries are powered by the expanded `SqliteRepository::getUsageSta
 | `redis.port`                  | 6379                  | Redis server port |
 | `redis.password`              | null                  | Optional Redis AUTH password |
 | `scheduler.log`               | `data/scheduler.log`  | Log file used by the Scheduler |
+| `ui.default_theme`            | 'system'              | Controls initial theme ('light', 'dark' or 'system') |
 
 All values are defined in `config/app.php` and loaded by `Kernel`.
 
@@ -508,7 +530,7 @@ flowchart TD
     SchedulerRun --> Scheduler
 ```
 
-`Kernel` wires together `KeyManager`, `TTS\Manager`, `SqliteRepository` and the two controllers. All synthesis paths converge on `Manager::generate()`, which selects a `ProviderInterface` implementation, caches results and records usage. The dashboard uses HTMX fragments while the API returns JSON with public audio URLs. Sessions + `users` table enable multi-user isolation and role checks (`admin` vs `user`). Piper is used as automatic fallback for offline/resilient operation. Voice cloning is handled by `Manager::cloneVoice()` which delegates to the provider, stores the voice, and makes it available in `listLibrary()`. The new SSML editor lives inside `DashboardController::renderSynthPanel()` with pure-JS tag insertion that feeds directly into the existing HTMX generation flow. **FFmpeg integration lives in `SynthesisResult::process()`** and is invoked automatically by `Manager`. The analytics dashboard is rendered server-side with Chart.js consuming JSON data produced by `SqliteRepository::getUsageStats()` (including automatic date-gap filling). **RateLimiter** sits in front of protected actions and uses Redis counters (per-user or per-IP) to enforce throttling. The plugin system lives in `Manager::registerProvider()` and is populated at boot by `Kernel`; any `ProviderInterface` can be added at runtime and is automatically surfaced in the UI, API and batch runner. The new `Scheduler` (with embedded `CronExpression` parser) reads from the `scheduled_jobs` table, evaluates due jobs, calls `BatchGenerator`, updates last-run timestamps and logs activity. It is intended to be executed by native system cron.
+`Kernel` wires together `KeyManager`, `TTS\Manager`, `SqliteRepository` and the two controllers. All synthesis paths converge on `Manager::generate()`, which selects a `ProviderInterface` implementation, caches results and records usage. The dashboard uses HTMX fragments while the API returns JSON with public audio URLs. Sessions + `users` table enable multi-user isolation and role checks (`admin` vs `user`). Piper is used as automatic fallback for offline/resilient operation. Voice cloning is handled by `Manager::cloneVoice()` which delegates to the provider, stores the voice, and makes it available in `listLibrary()`. The new SSML editor lives inside `DashboardController::renderSynthPanel()` with pure-JS tag insertion that feeds directly into the existing HTMX generation flow. **FFmpeg integration lives in `SynthesisResult::process()`** and is invoked automatically by `Manager`. The analytics dashboard is rendered server-side with Chart.js consuming JSON data produced by `SqliteRepository::getUsageStats()` (including automatic date-gap filling). **RateLimiter** sits in front of protected actions and uses Redis counters (per-user or per-IP) to enforce throttling. The plugin system lives in `Manager::registerProvider()` and is populated at boot by `Kernel`; any `ProviderInterface` can be added at runtime and is automatically surfaced in the UI, API and batch runner. The new `Scheduler` (with embedded `CronExpression` parser) reads from the `scheduled_jobs` table, evaluates due jobs, calls `BatchGenerator`, updates last-run timestamps and logs activity. It is intended to be executed by native system cron. The UI layer now includes a persistent theme engine (localStorage + Tailwind `dark` class on `<html>`) and accessibility enhancements throughout all rendered markup and fragments.
 
 ## 📁 Project structure
 
@@ -573,7 +595,7 @@ The test suite covers `KeyManager` token issuance, validation, expiry checks, en
 - [x] Redis-backed rate limiter and request throttling
 - [x] Plugin system for registering new TTS providers at runtime
 - [x] Scheduled batch jobs using native cron expressions
-- [ ] Dark/light mode persistence and improved accessibility
+- [x] Dark/light mode persistence and improved accessibility
 - [ ] Exportable voice library as portable JSON bundles
 
 > 🤖 This roadmap is worked through continuously — ideas and PRs welcome!
