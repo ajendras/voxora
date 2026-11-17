@@ -19,6 +19,7 @@ use DateTimeImmutable;
  * Supports a progress callback for CLI or UI feedback.
  *
  * CSV may now contain "format" (mp3/wav) and "normalize" (true/false) columns.
+ * Used by Scheduler for recurring cron-driven batch jobs.
  */
 final class BatchGenerator
 {
@@ -56,7 +57,8 @@ final class BatchGenerator
      * Execute batch from a CSV file.
      *
      * CSV columns (case-insensitive): text, voice_id (or voice), provider, filename (optional),
-     * format (mp3/wav), normalize (true/false)
+     * format (mp3/wav), normalize (true/false). The $options array may contain a
+     * 'scheduled' flag when invoked by Scheduler.
      *
      * @param string $csvPath Absolute or relative path to CSV
      * @param callable|null $progress Optional callback: fn(int $current, int $total, string $message, ?string $filePath): void
@@ -129,16 +131,19 @@ final class BatchGenerator
                 $successful++;
                 $totalDuration += (float) ($result->duration ?? 3.0);
 
+                $context = [
+                    'text' => $text,
+                    'voice_id' => $voiceId,
+                    'provider' => $provider ?? 'elevenlabs',
+                    'audio_url' => $filepath,
+                    'user_id' => null,
+                    'filename' => $filename,
+                    'batch' => true,
+                    'scheduled' => $options['scheduled'] ?? false,
+                ];
+
                 if ($this->webhookDispatcher !== null) {
-                    $this->webhookDispatcher->dispatchSuccess($result, [
-                        'text' => $text,
-                        'voice_id' => $voiceId,
-                        'provider' => $provider ?? 'elevenlabs',
-                        'audio_url' => $filepath,
-                        'user_id' => null,
-                        'filename' => $filename,
-                        'batch' => true,
-                    ]);
+                    $this->webhookDispatcher->dispatchSuccess($result, $context);
                 }
 
                 if ($progress !== null) {

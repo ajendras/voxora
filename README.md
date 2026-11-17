@@ -32,6 +32,7 @@ Developers integrating high-quality voices face fragmented provider APIs, expose
 - **Audio post-processing** — FFmpeg integration for loudness normalization (EBU R128 loudnorm), peak limiting, format conversion (MP3/WAV) and duration measurement.
 - **Production ready** — Redis-backed rate limiter prevents abuse with per-user/token throttling (fails open on Redis outage).
 - **Plugin system** — Register new TTS providers at runtime with `Manager::registerProvider()`; they are automatically available in the dashboard, API, batch jobs and analytics.
+- **Scheduled Batch Jobs** — Define recurring CSV synthesis with native cron expressions (`0 9 * * *`). `Scheduler::runDue()` is safe to invoke every minute from system cron; jobs and last-run state are persisted in SQLite.
 
 ## 🎬 Demo
 
@@ -104,6 +105,12 @@ Redis-backed request throttling (<code>RateLimiter</code>) with configurable per
 <td valign="top" colspan="3">
 🔌 <b>Plugin System</b><br>
 Register new TTS providers at runtime with <code>Manager::registerProvider('myprovider', $instance)</code>. Custom providers appear automatically in UI, API, batch jobs and analytics.
+</td>
+</tr>
+<tr>
+<td valign="top" colspan="3">
+⏰ <b>Scheduled Batch Jobs</b><br>
+<code>Scheduler</code> + lightweight <code>CronExpression</code> parser. Persisted jobs, last-run deduplication, system-cron friendly (<code>* * * * *</code>).
 </td>
 </tr>
 </table>
@@ -349,6 +356,70 @@ if ($report->failed > 0) {
 ```
 </details>
 
+### Scheduled batch jobs using native cron expressions
+
+The new `Scheduler` lets you register persistent jobs that execute `BatchGenerator::run()` according to standard cron expressions. A lightweight `CronExpression` parser (5-field: minute hour dom month dow) supports wildcards, ranges, lists and steps. Jobs are stored in the `scheduled_jobs` SQLite table; last-run timestamps prevent duplicate execution in the same minute.
+
+**Register jobs (run once):**
+
+```php
+use Voxora\Kernel;
+use Voxora\Automation\Scheduler;
+
+$config = require __DIR__ . '/config/app.php';
+$kernel = new Kernel($config);
+$kernel->boot();
+
+$scheduler = $kernel->getScheduler();
+
+$scheduler->addJob(
+    name: 'Daily Podcast',
+    cronExpression: '0 9 * * *',           // every day at 09:00
+    csvPath: __DIR__ . '/batches/podcast.csv',
+    defaultOptions: [
+        'normalize' => true,
+        'format' => 'mp3',
+        'target_loudness' => -16.0
+    ]
+);
+```
+
+**Run due jobs (invoke from system cron every minute):**
+
+Create `examples/scheduler-run.php`:
+
+```php
+<?php
+require __DIR__ . '/../vendor/autoload.php';
+
+use Voxora\Kernel;
+
+$config = require __DIR__ . '/../config/app.php';
+$kernel = (new Kernel($config))->boot();
+
+$results = $kernel->getScheduler()->runDue(
+    function (int $cur, int $tot, string $msg, ?string $file = null) {
+        echo "[$cur/$tot] $msg\n";
+    }
+);
+
+echo "Executed " . count($results) . " job(s).\n";
+print_r($results);
+```
+
+Add to crontab (`crontab -e`):
+
+```cron
+* * * * * cd /var/www/voxora && php examples/scheduler-run.php >> data/scheduler.log 2>&1
+```
+
+**Management & logging**
+
+- `Scheduler::listJobs()` returns all registered jobs.
+- Execution is logged to `data/scheduler.log`.
+- Webhooks (if configured) receive a `batch_report` payload for successful runs.
+- The `SqliteRepository` automatically creates the `scheduled_jobs` table on first boot.
+
 ### Call the JSON API directly
 
 ```bash
@@ -393,6 +464,7 @@ All analytics queries are powered by the expanded `SqliteRepository::getUsageSta
 | `redis.host`                  | 127.0.0.1             | Redis server hostname |
 | `redis.port`                  | 6379                  | Redis server port |
 | `redis.password`              | null                  | Optional Redis AUTH password |
+| `scheduler.log`               | `data/scheduler.log`  | Log file used by the Scheduler |
 
 All values are defined in `config/app.php` and loaded by `Kernel`.
 
@@ -421,7 +493,9 @@ flowchart TD
     Provider --> Piper[PiperProvider<br>(throws on clone)]
     Manager --> Fallback[Fallback to Piper on cloud error]
     Manager --> PostProcess[SynthesisResult::process()<br>FFmpeg loudnorm + conversion]
-    Manager --> Repo[SqliteRepository<br>(users, generations, voices with is_cloned)]
+    Manager --> Repo[SqliteRepository<br>(users, generations, voices with is_cloned, scheduled_jobs)]
+    Scheduler[Scheduler + CronExpression] --> Repo
+    Scheduler --> Batch[BatchGenerator::run]
     Upload[Sample Upload] --> Api
     Api --> Manager
     Manager --> Repo[saveCustomVoice]
@@ -430,9 +504,11 @@ flowchart TD
     Users[(users table<br>role-based)]
     Repo --> Analytics[Analytics queries for Chart.js<br>(daily usage, provider breakdown)]
     Dashboard --> Analytics
+    Cron[System cron * * * * *] --> SchedulerRun[examples/scheduler-run.php]
+    SchedulerRun --> Scheduler
 ```
 
-`Kernel` wires together `KeyManager`, `TTS\Manager`, `SqliteRepository` and the two controllers. All synthesis paths converge on `Manager::generate()`, which selects a `ProviderInterface` implementation, caches results and records usage. The dashboard uses HTMX fragments while the API returns JSON with public audio URLs. Sessions + `users` table enable multi-user isolation and role checks (`admin` vs `user`). Piper is used as automatic fallback for offline/resilient operation. Voice cloning is handled by `Manager::cloneVoice()` which delegates to the provider, stores the voice, and makes it available in `listLibrary()`. The new SSML editor lives inside `DashboardController::renderSynthPanel()` with pure-JS tag insertion that feeds directly into the existing HTMX generation flow. **FFmpeg integration lives in `SynthesisResult::process()`** and is invoked automatically by `Manager`. The analytics dashboard is rendered server-side with Chart.js consuming JSON data produced by `SqliteRepository::getUsageStats()` (including automatic date-gap filling). **RateLimiter** sits in front of protected actions and uses Redis counters (per-user or per-IP) to enforce throttling. The plugin system lives in `Manager::registerProvider()` and is populated at boot by `Kernel`; any `ProviderInterface` can be added at runtime and is automatically surfaced in the UI, API and batch runner.
+`Kernel` wires together `KeyManager`, `TTS\Manager`, `SqliteRepository` and the two controllers. All synthesis paths converge on `Manager::generate()`, which selects a `ProviderInterface` implementation, caches results and records usage. The dashboard uses HTMX fragments while the API returns JSON with public audio URLs. Sessions + `users` table enable multi-user isolation and role checks (`admin` vs `user`). Piper is used as automatic fallback for offline/resilient operation. Voice cloning is handled by `Manager::cloneVoice()` which delegates to the provider, stores the voice, and makes it available in `listLibrary()`. The new SSML editor lives inside `DashboardController::renderSynthPanel()` with pure-JS tag insertion that feeds directly into the existing HTMX generation flow. **FFmpeg integration lives in `SynthesisResult::process()`** and is invoked automatically by `Manager`. The analytics dashboard is rendered server-side with Chart.js consuming JSON data produced by `SqliteRepository::getUsageStats()` (including automatic date-gap filling). **RateLimiter** sits in front of protected actions and uses Redis counters (per-user or per-IP) to enforce throttling. The plugin system lives in `Manager::registerProvider()` and is populated at boot by `Kernel`; any `ProviderInterface` can be added at runtime and is automatically surfaced in the UI, API and batch runner. The new `Scheduler` (with embedded `CronExpression` parser) reads from the `scheduled_jobs` table, evaluates due jobs, calls `BatchGenerator`, updates last-run timestamps and logs activity. It is intended to be executed by native system cron.
 
 ## 📁 Project structure
 
@@ -456,14 +532,18 @@ flowchart TD
 │   │   ├── DashboardController.php # HTMX pages + generateAction + login/logout + rich SSML editor + analytics
 │   │   └── ApiController.php     # speechAction, historyAction, issueTokenAction, cloneVoiceAction (role-aware)
 │   ├── Storage/
-│   │   └── SqliteRepository.php  # schema (users + voices with is_cloned), analytics queries, getUsageStats() with Chart.js data
+│   │   └── SqliteRepository.php  # schema (users + voices with is_cloned + scheduled_jobs), analytics queries, getUsageStats() with Chart.js data
 │   └── Automation/
-│       └── BatchGenerator.php    # run(csvPath, progress), Report value object
+│       ├── BatchGenerator.php    # run(csvPath, progress), Report value object
+│       └── Scheduler.php         # CronExpression parser + Scheduler for recurring jobs
 ├── examples/
-│   └── batch.php                 # CLI demo using Manager + BatchGenerator
+│   ├── batch.php                 # CLI demo using Manager + BatchGenerator
+│   └── scheduler-run.php         # Entry-point called by system cron (runDue())
 ├── tests/
 │   └── Unit/
-│       └── KeyManagerTest.php    # token issuance, validation, expiry, scopes, roles
+│       ├── KeyManagerTest.php    # token issuance, validation, expiry, scopes, roles
+│       ├── PiperProviderTest.php
+│       └── SchedulerTest.php     # CronExpression + Scheduler (mocks)
 └── data/                         # SQLite DB and generated audio (gitignored)
 ```
 
@@ -477,7 +557,7 @@ vendor/bin/phpunit
 
 PHPUnit is configured via `phpunit.xml.dist` (disables the result cache to avoid "Could not write test results to cache file" errors in CI environments such as the PHP 8.2 job).
 
-The test suite covers `KeyManager` token issuance, validation, expiry checks, encryption round-trips, scope enforcement and the new role/userId fields. `PiperProviderTest` validates WAV duration extraction from the RIFF header (using a mocked Symfony Process for reliable CI runs), confirms `cloneVoice()` throws as expected, and exercises `WebhookDispatcher` with Piper results without attempting to mock the final dispatcher class. RateLimiter behavior (allowed/blocked windows, mock Redis interactions) is covered inside `KeyManagerTest`. New tests cover the plugin registration API and resolution of custom providers.
+The test suite covers `KeyManager` token issuance, validation, expiry checks, encryption round-trips, scope enforcement and the new role/userId fields. `PiperProviderTest` validates WAV duration extraction from the RIFF header (using a mocked Symfony Process for reliable CI runs), confirms `cloneVoice()` throws as expected, and exercises `WebhookDispatcher` with Piper results without attempting to mock the final dispatcher class. RateLimiter behavior (allowed/blocked windows, mock Redis interactions) is covered inside `KeyManagerTest`. New tests cover the plugin registration API and resolution of custom providers. `SchedulerTest` exercises `CronExpression::isDue()` for common patterns and the full scheduler flow with mocked repository and batch generator.
 
 ## 📍 Roadmap
 
@@ -492,7 +572,7 @@ The test suite covers `KeyManager` token issuance, validation, expiry checks, en
 - [x] Configurable webhooks on successful generation
 - [x] Redis-backed rate limiter and request throttling
 - [x] Plugin system for registering new TTS providers at runtime
-- [ ] Scheduled batch jobs using native cron expressions
+- [x] Scheduled batch jobs using native cron expressions
 - [ ] Dark/light mode persistence and improved accessibility
 - [ ] Exportable voice library as portable JSON bundles
 
