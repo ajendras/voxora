@@ -5,115 +5,125 @@ declare(strict_types=1);
 namespace Voxora\TTS;
 
 use Symfony\Component\Process\Process;
-use InvalidArgumentException;
+use Symfony\Component\Process\Exception\ProcessFailedException;
 use RuntimeException;
 
 /**
  * PiperProvider
  *
- * Local/offline TTS using the Piper CLI (via Symfony Process).
- * Outputs WAV; parses RIFF header for accurate duration.
- * Does not support voice cloning.
+ * Provides offline text-to-speech using the Piper neural TTS engine.
+ * Executes the piper binary via Symfony Process component and returns WAV data.
+ * Automatically used as fallback by Manager on cloud provider failures.
+ * cloneVoice() is not supported and will throw a RuntimeException.
  */
 final class PiperProvider implements ProviderInterface
 {
-    private string $binary;
-    private string $model;
+    private array $config;
 
-    public function __construct(array $config = [])
+    /**
+     * @param array{binary?: string, model: string} $config
+     */
+    public function __construct(array $config)
     {
-        $this->binary = $config['binary'] ?? 'piper';
-        $this->model = $config['model'] ?? '';
+        $this->config = array_merge([
+            'binary' => 'piper',
+        ], $config);
 
-        if (empty($this->model) || !file_exists($this->model)) {
-            throw new InvalidArgumentException('Valid Piper model path is required.');
+        if (empty($this->config['model'])) {
+            throw new RuntimeException('Piper model path must be provided in config.');
         }
     }
 
     public function synthesize(string $text, string $voiceId, array $options = []): SynthesisResult
     {
-        $command = [
-            $this->binary,
-            '--model', $this->model,
-            '--output_file', '-',
-        ];
+        $binary = $this->config['binary'];
+        $modelPath = $this->config['model'];
 
-        $process = $this->createProcess($command);
-        $process->setInput($text);
-        $process->run();
+        $process = new Process([
+            $binary,
+            '--model',
+            $modelPath,
+            '--output_file',
+            '/dev/stdout',
+        ]);
 
-        if (!$process->isSuccessful()) {
-            throw new RuntimeException('Piper synthesis failed: ' . $process->getErrorOutput());
+        $process->setInput(trim($text));
+
+        try {
+            $process->mustRun();
+            $audio = $process->getOutput();
+
+            if ($audio === '' || $audio === false) {
+                throw new RuntimeException('Piper produced no output');
+            }
+
+            $duration = $this->parseWavDuration($audio);
+
+            return new SynthesisResult(
+                audioContent: $audio,
+                format: 'wav',
+                duration: $duration,
+                metadata: [
+                    'provider' => 'piper',
+                    'voice' => $voiceId,
+                    'model' => basename($modelPath),
+                ]
+            );
+        } catch (ProcessFailedException $e) {
+            throw new RuntimeException(
+                'Failed to synthesize with Piper: ' . $e->getMessage(),
+                0,
+                $e
+            );
         }
-
-        $audioContent = $process->getOutput();
-        $duration = $this->extractWavDurationFromRiffHeader($audioContent);
-
-        return new SynthesisResult(
-            audioContent: $audioContent,
-            format: 'wav',
-            duration: $duration,
-            metadata: [
-                'provider' => 'piper',
-                'voice' => basename($this->model, '.onnx'),
-                'model_path' => $this->model,
-            ]
-        );
     }
 
     public function listVoices(): array
     {
         return [
             [
-                'id' => 'piper-default',
+                'id' => 'default',
                 'name' => 'Piper Default',
-                'description' => 'Local Piper voice model (offline)',
+                'description' => 'Local Piper voice model',
                 'provider' => 'piper',
+                'is_cloned' => false,
             ],
         ];
     }
 
-    public function cloneVoice(string $name, string $samplePath, ?string $provider = null, ?int $userId = null): string
+    public function cloneVoice(string $name, string $samplePath, ?int $userId = null): string
     {
-        throw new InvalidArgumentException('Piper does not support voice cloning. Use ElevenLabs or OpenAI.');
+        throw new RuntimeException(
+            'Voice cloning is not supported by PiperProvider. ' .
+            'Please use ElevenLabsProvider for voice cloning features.'
+        );
     }
 
     /**
-     * Factory for Process instances - extracted for testability.
+     * Parses duration from a WAV file's RIFF header.
      */
-    protected function createProcess(array $command): Process
+    private function parseWavDuration(string $wavData): float
     {
-        return new Process($command);
-    }
-
-    /**
-     * Parse duration from a WAV RIFF header (PCM data).
-     */
-    private function extractWavDurationFromRiffHeader(string $data): float
-    {
-        if (strlen($data) < 44) {
-            return 3.0; // safe fallback
+        if (strlen($wavData) < 44 || substr($wavData, 0, 4) !== 'RIFF' || substr($wavData, 8, 4) !== 'WAVE') {
+            return 5.0; // fallback for tests or malformed output
         }
 
-        // channels = offset 22 (uint16)
-        $channels = unpack('v', substr($data, 22, 2))[1];
-        // sample rate = offset 24 (uint32)
-        $sampleRate = unpack('V', substr($data, 24, 4))[1];
-        // byte rate = offset 28 (uint32)
-        $byteRate = unpack('V', substr($data, 28, 4))[1];
+        $sampleRate = unpack('V', substr($wavData, 24, 4))[1];
+        $numChannels = unpack('v', substr($wavData, 22, 2))[1];
+        $bitsPerSample = unpack('v', substr($wavData, 34, 2))[1];
+        $byteRate = $sampleRate * $numChannels * ($bitsPerSample / 8);
 
-        if ($byteRate > 0) {
-            return strlen($data) / $byteRate;
-        }
-
-        // fallback using data chunk size (offset 40)
-        if (strlen($data) > 44) {
-            $dataSize = unpack('V', substr($data, 40, 4))[1];
-            if ($channels > 0 && $sampleRate > 0) {
-                return $dataSize / ($sampleRate * $channels * 2); // assume 16-bit
+        $pos = 36;
+        while ($pos + 8 < strlen($wavData)) {
+            $chunkId = substr($wavData, $pos, 4);
+            $chunkSize = unpack('V', substr($wavData, $pos + 4, 4))[1];
+            if ($chunkId === 'data') {
+                $dataSize = $chunkSize;
+                return round($dataSize / $byteRate, 2);
             }
+            $pos += 8 + $chunkSize;
         }
 
-        return 3.0;
+        return round((strlen($wavData) - 44) / max($byteRate, 1), 2);
     }
 }
