@@ -63,7 +63,7 @@ HTMX form in <code>DashboardController::generateAction()</code> with rich SSML e
 </td>
 <td valign="top">
 📚 <b>Voice Library</b><br>
-Curated + cloned voices stored via <code>SqliteRepository::listLibrary()</code>; exportable as portable JSON bundles via <code>/api/v1/library/export</code>
+Curated + cloned voices stored via <code>SqliteRepository::listLibrary()</code>; exportable and importable as portable JSON bundles via <code>/api/v1/library/export</code> and <code>/api/v1/library/import</code>
 </td>
 <td valign="top">
 📊 <b>Analytics Hub</b><br>
@@ -437,47 +437,30 @@ curl -X POST http://localhost:8080/api/v1/speech \
 
 Provider can be set to `piper` for local synthesis. Use `/api/v1/clone-voice` for cloning. SSML inside the `text` field is passed through to the provider. New fields control FFmpeg processing.
 
-### Voice Library Export (new)
+### Voice Library Export & Import
 
-The voice library (curated voices + any cloned voices you have added) can now be exported as a portable, versioned JSON bundle. The bundle is self-describing and can be saved, shared, backed up, or imported into another Voxora instance (import support coming in a future release).
+The voice library (curated voices + any cloned voices you have added) can be exported and imported as a portable, versioned JSON bundle. The bundle is self-describing and can be saved, shared, backed up, or imported into another Voxora instance.
 
-**Via API (recommended):**
+**Export (existing):**
 
 ```bash
 curl -X GET http://localhost:8080/api/v1/library/export \
   -H "X-Api-Key: vxo_..." > voices-bundle.json
 ```
 
-The returned JSON follows this structure:
+**Import (new):**
 
-```json
-{
-  "version": "1.0",
-  "exported_at": "2024-10-05T14:30:00+00:00",
-  "generated_by": "Voxora",
-  "total_voices": 12,
-  "voices": [
-    {
-      "id": "21m00Tcm4TlvDq8ikWAM",
-      "name": "Rachel",
-      "description": "American • Warm & versatile",
-      "provider": "elevenlabs",
-      "cloned": false
-    },
-    {
-      "id": "my-cloned-voice-123",
-      "name": "My Custom Narrator",
-      "description": "Cloned voice",
-      "provider": "elevenlabs",
-      "cloned": true
-    }
-  ]
-}
+```bash
+curl -X POST http://localhost:8080/api/v1/library/import \
+  -H "X-Api-Key: vxo_..." \
+  -F "bundle=@voices-bundle.json"
 ```
 
-**Via Dashboard:** Visit `/library`. A prominent **Export JSON Bundle** button triggers the same download.
+The response returns the number of newly imported voices (duplicates by `id` are skipped). The bundle format is the same as the export (version 1.0 with a `voices` array).
 
-The bundle only contains metadata (no audio samples). Voice IDs remain valid for any instance that has access to the same TTS provider account.
+**Via Dashboard:** Visit `/library`. In addition to the export button you will now see an **Import JSON Bundle** upload form. After a successful upload the page shows a confirmation with the import count and refreshes the voice list.
+
+Only valid version 1.0 bundles are accepted. The import is protected by the same token scoping and rate limiting as other library operations.
 
 ### Analytics Dashboard
 
@@ -542,8 +525,8 @@ flowchart TD
     Kernel --> Router[Router]
     Kernel --> Redis[Predis Client]
     Kernel --> RateLimiter[RateLimiter (Redis incr/expire)]
-    Router --> Dashboard[DashboardController<br>(login, index, generate)]
-    Router --> Api[ApiController<br>(cloneVoiceAction)]
+    Router --> Dashboard[DashboardController<br>(login, index, generate, library)]
+    Router --> Api[ApiController<br>(cloneVoiceAction, importLibraryAction)]
     Api --> RateLimiter
     Dashboard --> RateLimiter
     Api --> KeyManager[KeyManager::validate<br>(role + userId)]
@@ -570,9 +553,12 @@ flowchart TD
     Dashboard --> Analytics
     Cron[System cron * * * * *] --> SchedulerRun[examples/scheduler-run.php]
     SchedulerRun --> Scheduler
+    ImportBundle[JSON Bundle Upload] --> Api.importLibraryAction
+    ImportBundle --> Dashboard.libraryAction
+    Api.importLibraryAction --> Repo.importLibrary
 ```
 
-`Kernel` wires together `KeyManager`, `TTS\Manager`, `SqliteRepository` and the two controllers. All synthesis paths converge on `Manager::generate()`, which selects a `ProviderInterface` implementation, caches results and records usage. The dashboard uses HTMX fragments while the API returns JSON with public audio URLs. Sessions + `users` table enable multi-user isolation and role checks (`admin` vs `user`). Piper is used as automatic fallback for offline/resilient operation. Voice cloning is handled by `Manager::cloneVoice()` which delegates to the provider, stores the voice, and makes it available in `listLibrary()`. The new SSML editor lives inside `DashboardController::renderSynthPanel()` with pure-JS tag insertion that feeds directly into the existing HTMX generation flow. **FFmpeg integration lives in `SynthesisResult::process()`** and is invoked automatically by `Manager`. The analytics dashboard is rendered server-side with Chart.js consuming JSON data produced by `SqliteRepository::getUsageStats()` (including automatic date-gap filling). **RateLimiter** sits in front of protected actions and uses Redis counters (per-user or per-IP) to enforce throttling. The plugin system lives in `Manager::registerProvider()` and is populated at boot by `Kernel`; any `ProviderInterface` can be added at runtime and is automatically surfaced in the UI, API and batch runner. The new `Scheduler` (with embedded `CronExpression` parser) reads from the `scheduled_jobs` table, evaluates due jobs, calls `BatchGenerator`, updates last-run timestamps and logs activity. It is intended to be executed by native system cron. The UI layer now includes a persistent theme engine (localStorage + Tailwind `dark` class on `<html>`) and accessibility enhancements throughout all rendered markup and fragments. The voice library export lives in `SqliteRepository::exportLibrary()` (returns a versioned array) and is exposed via a new `ApiController::exportLibraryAction()` endpoint.
+`Kernel` wires together `KeyManager`, `TTS\Manager`, `SqliteRepository` and the two controllers. All synthesis paths converge on `Manager::generate()`, which selects a `ProviderInterface` implementation, caches results and records usage. The dashboard uses HTMX fragments while the API returns JSON with public audio URLs. Sessions + `users` table enable multi-user isolation and role checks (`admin` vs `user`). Piper is used as automatic fallback for offline/resilient operation. Voice cloning is handled by `Manager::cloneVoice()` which delegates to the provider, stores the voice, and makes it available in `listLibrary()`. The new SSML editor lives inside `DashboardController::renderSynthPanel()` with pure-JS tag insertion that feeds directly into the existing HTMX generation flow. **FFmpeg integration lives in `SynthesisResult::process()`** and is invoked automatically by `Manager`. The analytics dashboard is rendered server-side with Chart.js consuming JSON data produced by `SqliteRepository::getUsageStats()` (including automatic date-gap filling). **RateLimiter** sits in front of protected actions and uses Redis counters (per-user or per-IP) to enforce throttling. The plugin system lives in `Manager::registerProvider()` and is populated at boot by `Kernel`; any `ProviderInterface` can be added at runtime and is automatically surfaced in the UI, API and batch runner. The new `Scheduler` (with embedded `CronExpression` parser) reads from the `scheduled_jobs` table, evaluates due jobs, calls `BatchGenerator`, updates last-run timestamps and logs activity. It is intended to be executed by native system cron. The UI layer now includes a persistent theme engine (localStorage + Tailwind `dark` class on `<html>`) and accessibility enhancements throughout all rendered markup and fragments. The voice library export lives in `SqliteRepository::exportLibrary()` (returns a versioned array) and is exposed via a new `ApiController::exportLibraryAction()` endpoint. The new import support lives in `SqliteRepository::importLibrary()`, `ApiController::importLibraryAction()` and `DashboardController::libraryAction()` (POST handling + HTMX fragment).
 
 ## 📁 Project structure
 
@@ -593,10 +579,10 @@ flowchart TD
 │   │   ├── SynthesisResult.php   # common result value object (mp3/wav) with FFmpeg process()
 │   │   └── Manager.php           # generate() with caching, usage recording & Piper fallback; cloneVoice(); registerProvider() plugin system
 │   ├── Http/
-│   │   ├── DashboardController.php # HTMX pages + generateAction + login/logout + rich SSML editor + analytics
-│   │   └── ApiController.php     # speechAction, historyAction, issueTokenAction, cloneVoiceAction (role-aware)
+│   │   ├── DashboardController.php # HTMX pages + generateAction + login/logout + rich SSML editor + analytics + library import
+│   │   └── ApiController.php     # speechAction, historyAction, issueTokenAction, cloneVoiceAction, importLibraryAction (role-aware)
 │   ├── Storage/
-│   │   └── SqliteRepository.php  # schema (users + voices with is_cloned + scheduled_jobs), analytics queries, getUsageStats() with Chart.js data
+│   │   └── SqliteRepository.php  # schema (users + voices with is_cloned + scheduled_jobs), analytics queries, getUsageStats() with Chart.js data, importLibrary()
 │   └── Automation/
 │       ├── BatchGenerator.php    # run(csvPath, progress), Report value object
 │       └── Scheduler.php         # CronExpression parser + Scheduler for recurring jobs
@@ -639,6 +625,14 @@ The test suite covers `KeyManager` token issuance, validation, expiry checks, en
 - [x] Scheduled batch jobs using native cron expressions
 - [x] Dark/light mode persistence and improved accessibility
 - [x] Exportable voice library as portable JSON bundles
+- [x] Add voice library import from JSON bundles (API + dashboard upload handler)
+- [ ] Implement built-in OpenAI TTS provider with voice listing and SSML support
+- [ ] Add web UI page for listing/editing/deleting scheduled batch jobs with status
+- [ ] Expand test coverage with integration tests for ApiController endpoints
+- [ ] Implement token revocation list in KeyManager with SQLite persistence
+- [ ] Add pagination and filters to generation history view and API endpoint
+- [ ] Provide official Docker Compose file with Redis, Piper and example voices
+- [ ] Write dedicated guide for implementing and registering custom TTS providers
 
 > 🤖 This roadmap is worked through continuously — ideas and PRs welcome!
 <!-- roadmap:end -->
