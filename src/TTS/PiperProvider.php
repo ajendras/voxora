@@ -6,58 +6,60 @@ namespace Voxora\TTS;
 
 use Symfony\Component\Process\Process;
 use RuntimeException;
+use InvalidArgumentException;
 
 /**
  * PiperProvider
  *
- * Local/offline TTS using the Piper engine via Symfony Process.
- * Outputs WAV audio. Does not support voice cloning (throws exception).
- * Consistent with ProviderInterface after API unification for options array.
+ * Local offline TTS using the Piper binary via Symfony Process.
+ * Outputs WAV, parses duration from RIFF header, supports SSML stripping.
+ * Throws on cloneVoice as it's not supported locally.
  */
 final class PiperProvider implements ProviderInterface
 {
-    private string $binaryPath;
-    private string $modelPath;
+    private array $config;
 
-    public function __construct(array $config = [])
+    public function __construct(array $config)
     {
-        $this->binaryPath = $config['binary'] ?? 'piper';
-        $this->modelPath = $config['model'] ?? '';
+        $this->config = $config;
 
-        if ($this->modelPath === '') {
-            throw new RuntimeException('Piper model path is required.');
+        if (empty($config['model']) || !file_exists($config['model'])) {
+            throw new InvalidArgumentException('Valid Piper model path is required.');
         }
     }
 
     public function synthesize(string $text, string $voiceId, array $options = []): SynthesisResult
     {
-        $outputFile = tempnam(sys_get_temp_dir(), 'piper_') . '.wav';
+        $text = trim($text);
+        if ($text === '') {
+            throw new InvalidArgumentException('Text cannot be empty for synthesis.');
+        }
+
+        $cleanText = $this->stripSSML($text);
+
+        $binary = $this->config['binary'] ?? 'piper';
+        $model = $this->config['model'];
 
         $process = new Process([
-            $this->binaryPath,
-            '--model', $this->modelPath,
-            '--output_file', $outputFile,
+            $binary,
+            '--model', $model,
+            '--output_file', '/dev/stdout',
         ]);
-        $process->setInput($text);
+
+        $process->setInput($cleanText . "\n");
         $process->run();
 
         if (!$process->isSuccessful()) {
-            @unlink($outputFile);
             throw new RuntimeException('Piper synthesis failed: ' . $process->getErrorOutput());
         }
 
-        if (!file_exists($outputFile)) {
-            throw new RuntimeException('Piper did not produce output file.');
+        $audioContent = $process->getOutput();
+
+        if (empty($audioContent)) {
+            throw new RuntimeException('Piper returned empty audio.');
         }
 
-        $audioContent = file_get_contents($outputFile);
-        @unlink($outputFile);
-
-        if ($audioContent === false || $audioContent === '') {
-            throw new RuntimeException('Failed to read Piper output.');
-        }
-
-        $duration = $this->extractWavDuration($audioContent);
+        $duration = $this->parseWavDuration($audioContent);
 
         return new SynthesisResult(
             audioContent: $audioContent,
@@ -65,32 +67,50 @@ final class PiperProvider implements ProviderInterface
             duration: $duration,
             metadata: [
                 'provider' => 'piper',
-                'voice_id' => $voiceId,
-                'model' => basename($this->modelPath),
-                'offline' => true,
+                'voice' => $voiceId ?: 'default',
+                'ssml_stripped' => $text !== $cleanText,
             ]
         );
     }
 
-    public function cloneVoice(string $name, string $samplePath, array $options = []): string
+    public function listVoices(): array
     {
-        throw new RuntimeException('Voice cloning is not supported by the Piper provider. Please use a cloud provider such as ElevenLabs.');
+        $modelName = basename($this->config['model'] ?? 'default', '.onnx');
+        $friendlyName = ucfirst(str_replace('_', ' ', $modelName));
+
+        return [
+            [
+                'id' => $modelName,
+                'name' => $friendlyName ?: 'Piper Default',
+                'description' => 'Local • High-quality offline voice',
+            ],
+        ];
     }
 
-    /**
-     * Extract duration from WAV RIFF header.
-     */
-    private function extractWavDuration(string $data): float
+    public function cloneVoice(string $name, string $samplePath, ?int $userId = null): string
     {
-        if (strlen($data) < 44 || substr($data, 0, 4) !== 'RIFF') {
-            return 3.0; // fallback default
+        throw new RuntimeException('Voice cloning is not supported by Piper (local TTS).');
+    }
+
+    private function stripSSML(string $text): string
+    {
+        $text = preg_replace('/<[^>]+>/', ' ', $text);
+
+        return trim(preg_replace('/\s+/', ' ', $text));
+    }
+
+    protected function parseWavDuration(string $data): float
+    {
+        if (strlen($data) < 44 || substr($data, 0, 4) !== 'RIFF' || substr($data, 8, 4) !== 'WAVE') {
+            return 3.0; // fallback
         }
 
-        $subchunk2Size = unpack('V', substr($data, 40, 4))[1] ?? 0;
+        // Parse byte rate and data size
         $byteRate = unpack('V', substr($data, 28, 4))[1] ?? 0;
-
-        if ($byteRate > 0) {
-            return round($subchunk2Size / $byteRate, 2);
+        $dataSizePos = strpos($data, 'data', 36);
+        if ($byteRate > 0 && $dataSizePos !== false) {
+            $dataSize = unpack('V', substr($data, $dataSizePos + 4, 4))[1] ?? 0;
+            return round($dataSize / $byteRate, 2);
         }
 
         return 3.0;

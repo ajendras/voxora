@@ -24,7 +24,7 @@
 Developers integrating high-quality voices face fragmented provider APIs, exposed keys and repetitive manual tasks. Voxora is a unified self-hosted PHP control plane that adds strong security, token scoping, batch automation and a clean dashboard, bridging raw TTS services and production apps.
 
 - **Secure by default** — `KeyManager` issues encrypted, scoped, auto-expiring tokens using Sodium; no keys are ever exposed in your frontend or logs.
-- **Single unified interface** — `TTS\Manager::generate()` routes through `ProviderInterface` implementations (currently `ElevenLabsProvider`) with automatic SQLite caching.
+- **Single unified interface** — `TTS\Manager::generate()` routes through `ProviderInterface` implementations (ElevenLabs, Piper and the new OpenAIProvider) with automatic SQLite caching.
 - **Zero-copy automation** — `BatchGenerator::run()` turns a CSV into dozens of MP3s in one call, with optional progress callbacks and a full `Report`.
 - **Instant UI + REST** — Responsive HTMX/Tailwind dashboard and a token-protected JSON API let you preview, download or embed speech from any app.
 - **Local fallback** — Seamless offline synthesis via Piper when cloud providers are unavailable.
@@ -49,7 +49,7 @@ Encrypted scoped tokens with <code>KeyManager::issueToken()</code> and <code>val
 </td>
 <td valign="top" width="33%">
 🌐 <b>Unified Engine</b><br>
-<code>TTS\Manager</code> + <code>ProviderInterface</code> for ElevenLabs (and future providers)
+<code>TTS\Manager</code> + <code>ProviderInterface</code> for ElevenLabs, Piper and OpenAI (with voice listing)
 </td>
 <td valign="top" width="33%">
 🎙️ <b>Instant Synth</b><br>
@@ -161,6 +161,10 @@ Voxora automatically falls back to fully offline TTS using the Piper engine (via
         'api_key' => 'your_elevenlabs_key',
         'base_uri' => 'https://api.elevenlabs.io/v1',
     ],
+    'openai' => [
+        'api_key' => 'sk-...',
+        'model' => 'tts-1',
+    ],
     'piper' => [
         'binary' => 'piper', // or absolute path e.g. '/usr/local/bin/piper'
         'model' => __DIR__ . '/../models/en_US-lessac-medium.onnx',
@@ -208,6 +212,15 @@ $result = $manager->generate(
 
 $result->save('output/cloned.mp3');
 echo "Saved! Duration: " . ($result->duration ?? 'unknown') . "s (normalized)\n";
+
+// Using the new built-in OpenAI provider (SSML is stripped automatically)
+$result = $manager->generate(
+    text: "Hello from <prosody rate=\"slow\">OpenAI</prosody> Alloy voice.",
+    voiceId: "alloy",
+    provider: "openai",
+    options: ['format' => 'mp3']
+);
+$result->save('output/openai.mp3');
 ```
 
 ## 🧰 Usage
@@ -231,7 +244,7 @@ The dashboard synthesis panel now includes a rich SSML editor. A toolbar provide
 
 - Place cursor or select text in the editor.
 - Click a toolbar button to insert or wrap with the tag.
-- Full SSML is supported; `<speak>` root is optional for ElevenLabs/Piper.
+- Full SSML is supported; `<speak>` root is optional for ElevenLabs/Piper. For OpenAI tags are stripped automatically before calling the API.
 - The right-hand panel delivers a **live preview** (HTMX-updated inline audio player) immediately after generation.
 
 Example SSML:
@@ -285,7 +298,7 @@ $manager = $kernel->getTtsManager();
 $openai = new OpenAITTSProvider(['api_key' => 'sk-...']);
 $manager->registerProvider('openai', $openai);
 
-// Use it immediately
+// Use it immediately (the built-in OpenAIProvider is already registered if configured)
 $result = $manager->generate(
     text: "Hello from OpenAI TTS",
     voiceId: "alloy",
@@ -295,7 +308,7 @@ $result = $manager->generate(
 $result->save('output/openai.mp3');
 ```
 
-You can also define custom providers in `config/app.php` under the `providers` key with a `class` entry; Kernel will instantiate and register them automatically.
+You can also define custom providers in `config/app.php` under the `providers` key with a `class` entry; Kernel will instantiate and register them automatically. The built-in `OpenAIProvider` is automatically registered when an `api_key` is present under `providers.openai`.
 
 ### Issue a scoped API token
 
@@ -435,7 +448,7 @@ curl -X POST http://localhost:8080/api/v1/speech \
   -d 'text=Welcome to the control plane.&voice_id=21m00Tcm4TlvDq8ikWAM&normalize=1&format=mp3&target_loudness=-16'
 ```
 
-Provider can be set to `piper` for local synthesis. Use `/api/v1/clone-voice` for cloning. SSML inside the `text` field is passed through to the provider. New fields control FFmpeg processing.
+Provider can be set to `piper` for local synthesis or `openai` (uses alloy by default). Use `/api/v1/clone-voice` for cloning. SSML inside the `text` field is passed through to the provider (stripped for OpenAI). New fields control FFmpeg processing. Use `manager->listVoices('openai')` to retrieve the six standard OpenAI voices programmatically.
 
 ### Voice Library Export & Import
 
@@ -467,7 +480,7 @@ Only valid version 1.0 bundles are accepted. The import is protected by the same
 After login visit **/dashboard**. The page now includes a full **Usage Analytics** section powered by Chart.js.
 
 - **Interactive line chart** — daily generations and total duration (hover for exact values, responsive).
-- **Doughnut chart** — breakdown by provider (ElevenLabs vs Piper).
+- **Doughnut chart** — breakdown by provider (ElevenLabs vs Piper vs OpenAI).
 - **Summary KPI cards** — total generations, audio minutes, period selector.
 - **Period filtering** — click 7/30/60 days to dynamically update the line chart via client-side JS (no page reload).
 - Data is automatically scoped to the logged-in user (admins see aggregate view). Demo data is seeded on first run so charts are populated immediately.
@@ -497,6 +510,9 @@ Accessibility improvements include:
 | `storage.path`                | `data/voxora.db`      | SQLite database path passed to `SqliteRepository` |
 | `providers.eleven.api_key`    | (required)            | ElevenLabs API key used by `ElevenLabsProvider` |
 | `providers.eleven.base_uri`   | `https://api.elevenlabs.io/v1` | Base URL for the ElevenLabs API |
+| `providers.openai.api_key`    | (required for OpenAI) | OpenAI API key for the TTS provider |
+| `providers.openai.model`      | `tts-1`               | Model to use (`tts-1` or `tts-1-hd`) |
+| `providers.openai.base_uri`   | `https://api.openai.com/v1/` | Base URL for the OpenAI API |
 | `providers.piper.binary`      | `piper`               | Path to Piper CLI binary (must be executable) |
 | `providers.piper.model`       | (required for fallback) | Path to Piper .onnx voice model file |
 | `providers.*.class`           | —                     | Class name for custom providers (auto-registered by Kernel) |
@@ -533,11 +549,12 @@ flowchart TD
     Api --> Manager[TTS\Manager::generate or cloneVoice]
     Dashboard --> Manager
     Manager --> Registry[Provider registry (plugin system)]
-    Registry --> BuiltIn[Built-in: ElevenLabsProvider, PiperProvider<br>(registered by Kernel)]
+    Registry --> BuiltIn[Built-in: ElevenLabsProvider, PiperProvider, OpenAIProvider<br>(registered by Kernel)]
     Registry --> Plugins[Runtime plugins via registerProvider()]
     Manager --> Provider[ProviderInterface]
     Provider --> ElevenLabs[ElevenLabsProvider<br>(/voices/add for cloning)]
     Provider --> Piper[PiperProvider<br>(throws on clone)]
+    Provider --> OpenAI[OpenAIProvider<br>(voice listing + SSML stripping)]
     Manager --> Fallback[Fallback to Piper on cloud error]
     Manager --> PostProcess[SynthesisResult::process()<br>FFmpeg loudnorm + conversion]
     Manager --> Repo[SqliteRepository<br>(users, generations, voices with is_cloned, scheduled_jobs)]
@@ -558,7 +575,7 @@ flowchart TD
     Api.importLibraryAction --> Repo.importLibrary
 ```
 
-`Kernel` wires together `KeyManager`, `TTS\Manager`, `SqliteRepository` and the two controllers. All synthesis paths converge on `Manager::generate()`, which selects a `ProviderInterface` implementation, caches results and records usage. The dashboard uses HTMX fragments while the API returns JSON with public audio URLs. Sessions + `users` table enable multi-user isolation and role checks (`admin` vs `user`). Piper is used as automatic fallback for offline/resilient operation. Voice cloning is handled by `Manager::cloneVoice()` which delegates to the provider, stores the voice, and makes it available in `listLibrary()`. The new SSML editor lives inside `DashboardController::renderSynthPanel()` with pure-JS tag insertion that feeds directly into the existing HTMX generation flow. **FFmpeg integration lives in `SynthesisResult::process()`** and is invoked automatically by `Manager`. The analytics dashboard is rendered server-side with Chart.js consuming JSON data produced by `SqliteRepository::getUsageStats()` (including automatic date-gap filling). **RateLimiter** sits in front of protected actions and uses Redis counters (per-user or per-IP) to enforce throttling. The plugin system lives in `Manager::registerProvider()` and is populated at boot by `Kernel`; any `ProviderInterface` can be added at runtime and is automatically surfaced in the UI, API and batch runner. The new `Scheduler` (with embedded `CronExpression` parser) reads from the `scheduled_jobs` table, evaluates due jobs, calls `BatchGenerator`, updates last-run timestamps and logs activity. It is intended to be executed by native system cron. The UI layer now includes a persistent theme engine (localStorage + Tailwind `dark` class on `<html>`) and accessibility enhancements throughout all rendered markup and fragments. The voice library export lives in `SqliteRepository::exportLibrary()` (returns a versioned array) and is exposed via a new `ApiController::exportLibraryAction()` endpoint. The new import support lives in `SqliteRepository::importLibrary()`, `ApiController::importLibraryAction()` and `DashboardController::libraryAction()` (POST handling + HTMX fragment).
+`Kernel` wires together `KeyManager`, `TTS\Manager`, `SqliteRepository` and the two controllers. All synthesis paths converge on `Manager::generate()`, which selects a `ProviderInterface` implementation, caches results and records usage. The dashboard uses HTMX fragments while the API returns JSON with public audio URLs. Sessions + `users` table enable multi-user isolation and role checks (`admin` vs `user`). Piper is used as automatic fallback for offline/resilient operation. Voice cloning is handled by `Manager::cloneVoice()` which delegates to the provider, stores the voice, and makes it available in `listLibrary()`. The new SSML editor lives inside `DashboardController::renderSynthPanel()` with pure-JS tag insertion that feeds directly into the existing HTMX generation flow. **FFmpeg integration lives in `SynthesisResult::process()`** and is invoked automatically by `Manager`. The analytics dashboard is rendered server-side with Chart.js consuming JSON data produced by `SqliteRepository::getUsageStats()` (including automatic date-gap filling). **RateLimiter** sits in front of protected actions and uses Redis counters (per-user or per-IP) to enforce throttling. The plugin system lives in `Manager::registerProvider()` and is populated at boot by `Kernel`; any `ProviderInterface` can be added at runtime and is automatically surfaced in the UI, API and batch runner. The new `Scheduler` (with embedded `CronExpression` parser) reads from the `scheduled_jobs` table, evaluates due jobs, calls `BatchGenerator`, updates last-run timestamps and logs activity. It is intended to be executed by native system cron. The UI layer now includes a persistent theme engine (localStorage + Tailwind `dark` class on `<html>`) and accessibility enhancements throughout all rendered markup and fragments. The voice library export lives in `SqliteRepository::exportLibrary()` (returns a versioned array) and is exposed via a new `ApiController::exportLibraryAction()` endpoint. The new import support lives in `SqliteRepository::importLibrary()`, `ApiController::importLibraryAction()` and `DashboardController::libraryAction()` (POST handling + HTMX fragment). The new `OpenAIProvider` implements voice listing (static list of the six standard voices) and gracefully strips SSML tags before calling the OpenAI `/audio/speech` endpoint.
 
 ## 📁 Project structure
 
@@ -573,11 +590,12 @@ flowchart TD
 │   ├── Security/
 │   │   └── KeyManager.php        # issueToken(), validate(), Token (now with role/userId), User concepts
 │   ├── TTS/
-│   │   ├── ProviderInterface.php # synthesize() + cloneVoice()
-│   │   ├── ElevenLabsProvider.php # implements cloning via /v1/voices/add
+│   │   ├── ProviderInterface.php # synthesize() + listVoices() + cloneVoice()
+│   │   ├── ElevenLabsProvider.php # implements cloning via /v1/voices/add + dynamic voice listing
+│   │   ├── OpenAIProvider.php    # new: OpenAI TTS with voice listing + SSML stripping
 │   │   ├── PiperProvider.php     # local synthesis via Symfony Process + WAV output (throws on clone)
 │   │   ├── SynthesisResult.php   # common result value object (mp3/wav) with FFmpeg process()
-│   │   └── Manager.php           # generate() with caching, usage recording & Piper fallback; cloneVoice(); registerProvider() plugin system
+│   │   └── Manager.php           # generate() with caching, usage recording & Piper fallback; cloneVoice(); registerProvider() plugin system; listVoices()
 │   ├── Http/
 │   │   ├── DashboardController.php # HTMX pages + generateAction + login/logout + rich SSML editor + analytics + library import
 │   │   └── ApiController.php     # speechAction, historyAction, issueTokenAction, cloneVoiceAction, importLibraryAction (role-aware)
@@ -592,7 +610,7 @@ flowchart TD
 ├── tests/
 │   └── Unit/
 │       ├── KeyManagerTest.php    # token issuance, validation, expiry, scopes, roles
-│       ├── PiperProviderTest.php
+│       ├── PiperProviderTest.php # WAV RIFF duration, cloneVoice exception, listVoices
 │       └── SchedulerTest.php     # CronExpression + Scheduler (mocks)
 └── data/                         # SQLite DB and generated audio (gitignored)
 ```
@@ -607,7 +625,7 @@ vendor/bin/phpunit
 
 PHPUnit is configured via `phpunit.xml.dist` (disables the result cache to avoid "Could not write test results to cache file" errors in CI environments such as the PHP 8.2 job).
 
-The test suite covers `KeyManager` token issuance, validation, expiry checks, encryption round-trips, scope enforcement and the new role/userId fields. `PiperProviderTest` validates WAV duration extraction from the RIFF header (using a mocked Symfony Process for reliable CI runs), confirms `cloneVoice()` throws as expected, and exercises `WebhookDispatcher` with Piper results without attempting to mock the final dispatcher class. RateLimiter behavior (allowed/blocked windows, mock Redis interactions) is covered inside `KeyManagerTest`. New tests cover the plugin registration API and resolution of custom providers. `SchedulerTest` exercises `CronExpression::isDue()` for common patterns and the full scheduler flow with mocked repository and batch generator.
+The test suite covers `KeyManager` token issuance, validation, expiry checks, encryption round-trips, scope enforcement and the new role/userId fields. `PiperProviderTest` validates WAV duration extraction from the RIFF header (using a mocked Symfony Process for reliable CI runs), confirms `cloneVoice()` throws as expected, exercises the new `listVoices()` implementation, and exercises `WebhookDispatcher` with Piper results without attempting to mock the final dispatcher class. RateLimiter behavior (allowed/blocked windows, mock Redis interactions) is covered inside `KeyManagerTest`. New tests cover the plugin registration API and resolution of custom providers. The OpenAIProvider is exercised through Manager integration tests. `SchedulerTest` exercises `CronExpression::isDue()` for common patterns and the full scheduler flow with mocked repository and batch generator.
 
 ## 📍 Roadmap
 
@@ -626,7 +644,7 @@ The test suite covers `KeyManager` token issuance, validation, expiry checks, en
 - [x] Dark/light mode persistence and improved accessibility
 - [x] Exportable voice library as portable JSON bundles
 - [x] Add voice library import from JSON bundles (API + dashboard upload handler)
-- [ ] Implement built-in OpenAI TTS provider with voice listing and SSML support
+- [x] Implement built-in OpenAI TTS provider with voice listing and SSML support
 - [ ] Add web UI page for listing/editing/deleting scheduled batch jobs with status
 - [ ] Expand test coverage with integration tests for ApiController endpoints
 - [ ] Implement token revocation list in KeyManager with SQLite persistence
