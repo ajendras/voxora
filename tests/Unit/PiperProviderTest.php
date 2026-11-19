@@ -9,143 +9,143 @@ use Voxora\TTS\PiperProvider;
 use Voxora\TTS\SynthesisResult;
 use Voxora\TTS\WebhookDispatcher;
 use Symfony\Component\Process\Process;
-use PHPUnit\Framework\MockObject\MockObject;
 use RuntimeException;
+use ReflectionMethod;
 
-class PiperProviderTest extends TestCase
+final class PiperProviderTest extends TestCase
 {
-    private PiperProvider $provider;
-    private MockObject $processMock;
+    private string $tempModelPath;
 
     protected function setUp(): void
     {
-        $this->processMock = $this->createMock(Process::class);
-
-        $config = [
-            'binary' => 'piper',
-            'model' => __DIR__ . '/../../models/test.onnx', // mocked path for unit test
-        ];
-
-        $this->provider = new PiperProvider($config);
+        $this->tempModelPath = tempnam(sys_get_temp_dir(), 'test_piper_model_') . '.onnx';
+        touch($this->tempModelPath);
     }
 
-    public function testParseWavDurationReturnsFloat()
+    protected function tearDown(): void
     {
-        // Synthetic WAV for ~3.0s @ 22050Hz, 1ch, 16-bit (used by CI to avoid real binary)
-        $durationExpected = 3.0;
-        $sampleRate = 22050;
-        $channels = 1;
-        $bitsPerSample = 16;
-        $bytesPerSample = (int) ($bitsPerSample / 8);
-        $dataSize = (int) ($durationExpected * $sampleRate * $channels * $bytesPerSample);
-        $fileSize = 36 + 8 + $dataSize;
+        if (file_exists($this->tempModelPath)) {
+            unlink($this->tempModelPath);
+        }
+    }
 
-        $wav = 'RIFF';
-        $wav .= pack('V', $fileSize);
-        $wav .= 'WAVE';
-        $wav .= 'fmt ';
-        $wav .= pack('V', 16);
-        $wav .= pack('v', 1);
-        $wav .= pack('v', $channels);
-        $wav .= pack('V', $sampleRate);
-        $wav .= pack('V', $sampleRate * $channels * $bytesPerSample);
-        $wav .= pack('v', $channels * $bytesPerSample);
-        $wav .= pack('v', $bitsPerSample);
-        $wav .= 'data';
-        $wav .= pack('V', $dataSize);
-        $wav .= str_repeat("\0", min(256, $dataSize)); // silent data (truncated for test)
+    private function createFakeWavHeader(int $sampleRate, int $channels, int $bits, int $dataBytes): string
+    {
+        $byteRate = $sampleRate * $channels * (int) ($bits / 8);
+        $blockAlign = $channels * (int) ($bits / 8);
+        $fileSize = 36 + $dataBytes;
 
-        $duration = $this->invokePrivateMethod($this->provider, 'parseWavDuration', [$wav]);
+        $header = 'RIFF';
+        $header .= pack('V', $fileSize);
+        $header .= 'WAVE';
+        $header .= 'fmt ';
+        $header .= pack('V', 16);
+        $header .= pack('v', 1);
+        $header .= pack('v', $channels);
+        $header .= pack('V', $sampleRate);
+        $header .= pack('V', $byteRate);
+        $header .= pack('v', $blockAlign);
+        $header .= pack('v', $bits);
+        $header .= 'data';
+        $header .= pack('V', $dataBytes);
+        $header .= str_repeat("\0", min(256, $dataBytes));
+
+        return $header;
+    }
+
+    public function testParseWavDurationReturnsFloat(): void
+    {
+        $provider = new PiperProvider(['model' => $this->tempModelPath]);
+
+        $method = new ReflectionMethod(PiperProvider::class, 'parseWavDuration');
+        $method->setAccessible(true);
+
+        $wav = $this->createFakeWavHeader(22050, 1, 16, 88200); // ~2s
+        $duration = $method->invoke($provider, $wav);
 
         $this->assertIsFloat($duration);
-        $this->assertGreaterThan(2.9, $duration);
-        $this->assertLessThan(3.1, $duration);
+        $this->assertEqualsWithDelta(2.0, $duration, 0.01);
     }
 
-    public function testSynthesizeUsesMockedProcessAndReturnsResultWithDuration()
+    public function testSynthesizeUsesMockedProcessAndReturnsResultWithDuration(): void
     {
-        // This test exercises the full synthesize path with a mocked Process (as described in README)
-        $mockProvider = $this->getMockBuilder(PiperProvider::class)
-            ->setConstructorArgs([['binary' => 'piper', 'model' => '/tmp/test.onnx']])
-            ->onlyMethods(['parseWavDuration'])
-            ->getMock();
+        $mockProcess = $this->createMock(Process::class);
+        $mockProcess->expects($this->once())
+            ->method('setInput')
+            ->with($this->isType('string'));
+        $mockProcess->expects($this->once())
+            ->method('run');
+        $mockProcess->method('isSuccessful')
+            ->willReturn(true);
+        $mockProcess->method('getOutput')
+            ->willReturn($this->createFakeWavHeader(22050, 1, 16, 88200));
 
-        $mockProvider->method('parseWavDuration')->willReturn(3.45);
+        $factory = fn(array $command): Process => $mockProcess;
 
-        $result = $mockProvider->synthesize('Hello test', 'default');
+        $provider = new PiperProvider([
+            'model' => $this->tempModelPath,
+            'process_factory' => $factory,
+        ]);
+
+        $result = $provider->synthesize('Hello from Piper test.', 'default');
 
         $this->assertInstanceOf(SynthesisResult::class, $result);
         $this->assertSame('wav', $result->format);
-        $this->assertSame(3.45, $result->duration);
-        $this->assertArrayHasKey('offline', $result->metadata);
-        $this->assertTrue($result->metadata['offline']);
+        $this->assertEqualsWithDelta(2.0, $result->duration ?? 0.0, 0.01);
+        $this->assertArrayHasKey('provider', $result->metadata);
+        $this->assertSame('piper', $result->metadata['provider']);
     }
 
-    public function testCloneVoiceThrowsException()
+    public function testCloneVoiceThrowsException(): void
     {
+        $provider = new PiperProvider(['model' => $this->tempModelPath]);
+
         $this->expectException(RuntimeException::class);
         $this->expectExceptionMessage('Voice cloning is not supported by the Piper provider.');
-        $this->provider->cloneVoice('Test Voice', '/tmp/sample.wav');
+
+        $provider->cloneVoice('Test Voice', '/tmp/nonexistent.wav');
     }
 
-    public function testListVoicesReturnsArray()
+    public function testListVoicesReturnsArray(): void
     {
-        $voices = $this->provider->listVoices();
+        $provider = new PiperProvider(['model' => $this->tempModelPath]);
+        $voices = $provider->listVoices();
+
         $this->assertIsArray($voices);
         $this->assertNotEmpty($voices);
         $this->assertArrayHasKey('id', $voices[0]);
-        $this->assertSame('default', $voices[0]['id']);
+        $this->assertArrayHasKey('name', $voices[0]);
+        $this->assertSame('piper', $voices[0]['provider']);
     }
 
-    public function testSynthesizeWithWebhookDispatcher()
+    public function testSynthesizeWithWebhookDispatcher(): void
     {
-        // Exercises WebhookDispatcher with Piper result (no final class mock, per README)
-        $dispatcher = new WebhookDispatcher('https://example.com/webhook', 'test-key');
+        $mockDispatcher = $this->createMock(WebhookDispatcher::class);
+        $mockDispatcher->expects($this->once())
+            ->method('dispatchSuccess');
 
-        // Use a real but tiny WAV so the real parseWavDuration runs
-        $tinyWav = $this->createMinimalWav(1.5);
-        $mockProvider = $this->getMockBuilder(PiperProvider::class)
-            ->setConstructorArgs([['binary' => 'piper', 'model' => '/tmp/test.onnx']])
-            ->onlyMethods([]) // no override of parse
-            ->getMock();
+        $mockProcess = $this->createMock(Process::class);
+        $mockProcess->expects($this->once())
+            ->method('setInput');
+        $mockProcess->expects($this->once())
+            ->method('run');
+        $mockProcess->method('isSuccessful')
+            ->willReturn(true);
+        $mockProcess->method('getOutput')
+            ->willReturn($this->createFakeWavHeader(22050, 1, 16, 44100));
 
-        $result = new SynthesisResult(
-            audioContent: $tinyWav,
-            format: 'wav',
-            duration: 1.5,
-            metadata: ['provider' => 'piper']
-        );
+        $factory = fn(array $command): Process => $mockProcess;
 
-        // The dispatcher is exercised but we don't assert network side-effects in unit test
+        $provider = new PiperProvider([
+            'model' => $this->tempModelPath,
+            'process_factory' => $factory,
+            'webhook_dispatcher' => $mockDispatcher,
+        ]);
+
+        $result = $provider->synthesize('Webhook test text.', 'default-voice');
+
         $this->assertInstanceOf(SynthesisResult::class, $result);
-        $this->assertGreaterThan(1.0, $result->duration);
-    }
-
-    private function invokePrivateMethod(object $object, string $methodName, array $parameters = [])
-    {
-        $reflection = new \ReflectionClass($object);
-        $method = $reflection->getMethod($methodName);
-        $method->setAccessible(true);
-
-        return $method->invokeArgs($object, $parameters);
-    }
-
-    private function createMinimalWav(float $seconds): string
-    {
-        $sampleRate = 22050;
-        $channels = 1;
-        $bits = 16;
-        $dataSize = (int) ($seconds * $sampleRate * $channels * ($bits / 8));
-        $fileSize = 36 + 8 + $dataSize;
-
-        $wav = 'RIFF' . pack('V', $fileSize) . 'WAVEfmt ';
-        $wav .= pack('V', 16) . pack('v', 1) . pack('v', $channels);
-        $wav .= pack('V', $sampleRate);
-        $wav .= pack('V', $sampleRate * $channels * 2);
-        $wav .= pack('v', 2) . pack('v', $bits);
-        $wav .= 'data' . pack('V', $dataSize);
-        $wav .= str_repeat("\0", 64); // minimal silent payload
-
-        return $wav;
+        $this->assertSame('wav', $result->format);
+        $this->assertGreaterThan(0.0, $result->duration ?? 0.0);
     }
 }
