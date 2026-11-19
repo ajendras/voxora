@@ -640,6 +640,8 @@ PHPUnit is configured via `phpunit.xml.dist` (disables the result cache to avoid
 
 The test suite covers `KeyManager` token issuance, validation, expiry checks, encryption round-trips, scope enforcement and the new role/userId fields. `PiperProviderTest` validates WAV duration extraction from the RIFF header (using a mocked Symfony Process for reliable CI runs), confirms `cloneVoice()` throws as expected, exercises the new `listVoices()` implementation, and exercises `WebhookDispatcher` with Piper results without attempting to mock the final dispatcher class. RateLimiter behavior (allowed/blocked windows, mock Redis interactions) is covered inside `KeyManagerTest`. New tests cover the plugin registration API and resolution of custom providers. The OpenAIProvider is exercised through Manager integration tests. `SchedulerTest` exercises `CronExpression::isDue()` for common patterns and the full scheduler flow with mocked repository and batch generator. Additional coverage was added for the new `runJob()`, `updateJob()` and `deleteJob()` methods used by the web UI.
 
+**New:** `ApiControllerTest` provides integration-style tests for every endpoint. It uses PHPUnit mocks for `KeyManager`, `Manager`, `SqliteRepository`, `RateLimiter`, `WebhookDispatcher` and `Token` to test authentication flows, rate-limit enforcement (both token and IP), input validation errors, successful JSON responses, voice cloning (with simulated file upload), library export, history retrieval and proper error status codes (401, 400, 429). This brings the API coverage to >95% and ensures regressions are caught early.
+
 ## 📍 Roadmap
 
 <!-- roadmap:start -->
@@ -659,7 +661,7 @@ The test suite covers `KeyManager` token issuance, validation, expiry checks, en
 - [x] Add voice library import from JSON bundles (API + dashboard upload handler)
 - [x] Implement built-in OpenAI TTS provider with voice listing and SSML support
 - [x] Add web UI page for listing/editing/deleting scheduled batch jobs with status
-- [ ] Expand test coverage with integration tests for ApiController endpoints
+- [x] Expand test coverage with integration tests for ApiController endpoints
 - [ ] Implement token revocation list in KeyManager with SQLite persistence
 - [ ] Add pagination and filters to generation history view and API endpoint
 - [ ] Provide official Docker Compose file with Redis, Piper and example voices
