@@ -111,7 +111,7 @@ Register new TTS providers at runtime with <code>Manager::registerProvider('mypr
 <tr>
 <td valign="top" colspan="3">
 ⏰ <b>Scheduled Batch Jobs</b><br>
-<code>Scheduler</code> + lightweight <code>CronExpression</code> parser. Persisted jobs, last-run deduplication, system-cron friendly (<code>* * * * *</code>).
+<code>Scheduler</code> + lightweight <code>CronExpression</code> parser. Persisted jobs with full web UI for listing, editing, deleting and status. System-cron friendly (<code>* * * * *</code>).
 </td>
 </tr>
 <tr>
@@ -440,6 +440,19 @@ Add to crontab (`crontab -e`):
 - Webhooks (if configured) receive a `batch_report` payload for successful runs.
 - The `SqliteRepository` automatically creates the `scheduled_jobs` table on first boot.
 
+### Scheduled Jobs Web UI
+
+After logging in visit **/dashboard/jobs**. The responsive Tailwind + HTMX interface provides:
+
+- **Overview table** showing name, cron expression, CSV path, last run time, status badge (success/failed/pending) and action buttons.
+- **Add new job** form with fields for name, cron, CSV path and default JSON options.
+- **Inline editing** — click Edit to populate the form and update any job.
+- **Run Now** — immediately executes the batch job and shows a live result summary.
+- **Delete** — safe removal with HTMX confirmation dialog.
+- Real-time status updates and a helpful cron tip at the bottom.
+
+All actions are protected by the active session. The page integrates with the existing dark/light theme and navigation.
+
 ### Call the JSON API directly
 
 ```bash
@@ -541,7 +554,7 @@ flowchart TD
     Kernel --> Router[Router]
     Kernel --> Redis[Predis Client]
     Kernel --> RateLimiter[RateLimiter (Redis incr/expire)]
-    Router --> Dashboard[DashboardController<br>(login, index, generate, library)]
+    Router --> Dashboard[DashboardController<br>(login, index, generate, library, jobs)]
     Router --> Api[ApiController<br>(cloneVoiceAction, importLibraryAction)]
     Api --> RateLimiter
     Dashboard --> RateLimiter
@@ -575,7 +588,7 @@ flowchart TD
     Api.importLibraryAction --> Repo.importLibrary
 ```
 
-`Kernel` wires together `KeyManager`, `TTS\Manager`, `SqliteRepository` and the two controllers. All synthesis paths converge on `Manager::generate()`, which selects a `ProviderInterface` implementation, caches results and records usage. The dashboard uses HTMX fragments while the API returns JSON with public audio URLs. Sessions + `users` table enable multi-user isolation and role checks (`admin` vs `user`). Piper is used as automatic fallback for offline/resilient operation. Voice cloning is handled by `Manager::cloneVoice()` which delegates to the provider, stores the voice, and makes it available in `listLibrary()`. The new SSML editor lives inside `DashboardController::renderSynthPanel()` with pure-JS tag insertion that feeds directly into the existing HTMX generation flow. **FFmpeg integration lives in `SynthesisResult::process()`** and is invoked automatically by `Manager`. The analytics dashboard is rendered server-side with Chart.js consuming JSON data produced by `SqliteRepository::getUsageStats()` (including automatic date-gap filling). **RateLimiter** sits in front of protected actions and uses Redis counters (per-user or per-IP) to enforce throttling. The plugin system lives in `Manager::registerProvider()` and is populated at boot by `Kernel`; any `ProviderInterface` can be added at runtime and is automatically surfaced in the UI, API and batch runner. The new `Scheduler` (with embedded `CronExpression` parser) reads from the `scheduled_jobs` table, evaluates due jobs, calls `BatchGenerator`, updates last-run timestamps and logs activity. It is intended to be executed by native system cron. The UI layer now includes a persistent theme engine (localStorage + Tailwind `dark` class on `<html>`) and accessibility enhancements throughout all rendered markup and fragments. The voice library export lives in `SqliteRepository::exportLibrary()` (returns a versioned array) and is exposed via a new `ApiController::exportLibraryAction()` endpoint. The new import support lives in `SqliteRepository::importLibrary()`, `ApiController::importLibraryAction()` and `DashboardController::libraryAction()` (POST handling + HTMX fragment). The new `OpenAIProvider` implements voice listing (static list of the six standard voices) and gracefully strips SSML tags before calling the OpenAI `/audio/speech` endpoint.
+`Kernel` wires together `KeyManager`, `TTS\Manager`, `SqliteRepository` and the two controllers. All synthesis paths converge on `Manager::generate()`, which selects a `ProviderInterface` implementation, caches results and records usage. The dashboard uses HTMX fragments while the API returns JSON with public audio URLs. Sessions + `users` table enable multi-user isolation and role checks (`admin` vs `user`). Piper is used as automatic fallback for offline/resilient operation. Voice cloning is handled by `Manager::cloneVoice()` which delegates to the provider, stores the voice, and makes it available in `listLibrary()`. The new SSML editor lives inside `DashboardController::renderSynthPanel()` with pure-JS tag insertion that feeds directly into the existing HTMX generation flow. **FFmpeg integration lives in `SynthesisResult::process()`** and is invoked automatically by `Manager`. The analytics dashboard is rendered server-side with Chart.js consuming JSON data produced by `SqliteRepository::getUsageStats()` (including automatic date-gap filling). **RateLimiter** sits in front of protected actions and uses Redis counters (per-user or per-IP) to enforce throttling. The plugin system lives in `Manager::registerProvider()` and is populated at boot by `Kernel`; any `ProviderInterface` can be added at runtime and is automatically surfaced in the UI, API and batch runner. The new `Scheduler` (with embedded `CronExpression` parser) reads from the `scheduled_jobs` table, evaluates due jobs, calls `BatchGenerator`, updates last-run timestamps and logs activity. It is intended to be executed by native system cron. The UI layer now includes a persistent theme engine (localStorage + Tailwind `dark` class on `<html>`) and accessibility enhancements throughout all rendered markup and fragments. The voice library export lives in `SqliteRepository::exportLibrary()` (returns a versioned array) and is exposed via a new `ApiController::exportLibraryAction()` endpoint. The new import support lives in `SqliteRepository::importLibrary()`, `ApiController::importLibraryAction()` and `DashboardController::libraryAction()` (POST handling + HTMX fragment). The new `OpenAIProvider` implements voice listing (static list of the six standard voices) and gracefully strips SSML tags before calling the OpenAI `/audio/speech` endpoint. The new jobs UI is fully integrated into `DashboardController::jobsAction()` with forms, HTMX actions and status badges powered by the expanded repository and scheduler methods.
 
 ## 📁 Project structure
 
@@ -597,13 +610,13 @@ flowchart TD
 │   │   ├── SynthesisResult.php   # common result value object (mp3/wav) with FFmpeg process()
 │   │   └── Manager.php           # generate() with caching, usage recording & Piper fallback; cloneVoice(); registerProvider() plugin system; listVoices()
 │   ├── Http/
-│   │   ├── DashboardController.php # HTMX pages + generateAction + login/logout + rich SSML editor + analytics + library import
+│   │   ├── DashboardController.php # HTMX pages + generateAction + login/logout + rich SSML editor + analytics + library import + jobs UI
 │   │   └── ApiController.php     # speechAction, historyAction, issueTokenAction, cloneVoiceAction, importLibraryAction (role-aware)
 │   ├── Storage/
-│   │   └── SqliteRepository.php  # schema (users + voices with is_cloned + scheduled_jobs), analytics queries, getUsageStats() with Chart.js data, importLibrary()
+│   │   └── SqliteRepository.php  # schema (users + voices with is_cloned + scheduled_jobs), analytics queries, getUsageStats() with Chart.js data, importLibrary(), job CRUD
 │   └── Automation/
 │       ├── BatchGenerator.php    # run(csvPath, progress), Report value object
-│       └── Scheduler.php         # CronExpression parser + Scheduler for recurring jobs
+│       └── Scheduler.php         # CronExpression parser + Scheduler for recurring jobs (list, edit, delete, runJob, runDue)
 ├── examples/
 │   ├── batch.php                 # CLI demo using Manager + BatchGenerator
 │   └── scheduler-run.php         # Entry-point called by system cron (runDue())
@@ -625,7 +638,7 @@ vendor/bin/phpunit
 
 PHPUnit is configured via `phpunit.xml.dist` (disables the result cache to avoid "Could not write test results to cache file" errors in CI environments such as the PHP 8.2 job).
 
-The test suite covers `KeyManager` token issuance, validation, expiry checks, encryption round-trips, scope enforcement and the new role/userId fields. `PiperProviderTest` validates WAV duration extraction from the RIFF header (using a mocked Symfony Process for reliable CI runs), confirms `cloneVoice()` throws as expected, exercises the new `listVoices()` implementation, and exercises `WebhookDispatcher` with Piper results without attempting to mock the final dispatcher class. RateLimiter behavior (allowed/blocked windows, mock Redis interactions) is covered inside `KeyManagerTest`. New tests cover the plugin registration API and resolution of custom providers. The OpenAIProvider is exercised through Manager integration tests. `SchedulerTest` exercises `CronExpression::isDue()` for common patterns and the full scheduler flow with mocked repository and batch generator.
+The test suite covers `KeyManager` token issuance, validation, expiry checks, encryption round-trips, scope enforcement and the new role/userId fields. `PiperProviderTest` validates WAV duration extraction from the RIFF header (using a mocked Symfony Process for reliable CI runs), confirms `cloneVoice()` throws as expected, exercises the new `listVoices()` implementation, and exercises `WebhookDispatcher` with Piper results without attempting to mock the final dispatcher class. RateLimiter behavior (allowed/blocked windows, mock Redis interactions) is covered inside `KeyManagerTest`. New tests cover the plugin registration API and resolution of custom providers. The OpenAIProvider is exercised through Manager integration tests. `SchedulerTest` exercises `CronExpression::isDue()` for common patterns and the full scheduler flow with mocked repository and batch generator. Additional coverage was added for the new `runJob()`, `updateJob()` and `deleteJob()` methods used by the web UI.
 
 ## 📍 Roadmap
 
@@ -645,7 +658,7 @@ The test suite covers `KeyManager` token issuance, validation, expiry checks, en
 - [x] Exportable voice library as portable JSON bundles
 - [x] Add voice library import from JSON bundles (API + dashboard upload handler)
 - [x] Implement built-in OpenAI TTS provider with voice listing and SSML support
-- [ ] Add web UI page for listing/editing/deleting scheduled batch jobs with status
+- [x] Add web UI page for listing/editing/deleting scheduled batch jobs with status
 - [ ] Expand test coverage with integration tests for ApiController endpoints
 - [ ] Implement token revocation list in KeyManager with SQLite persistence
 - [ ] Add pagination and filters to generation history view and API endpoint
