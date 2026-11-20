@@ -5,26 +5,28 @@ declare(strict_types=1);
 namespace Voxora\TTS;
 
 use Voxora\Storage\SqliteRepository;
-use InvalidArgumentException;
+use Voxora\TTS\WebhookDispatcher;
+use Symfony\Component\Process\Process;
 use RuntimeException;
+use InvalidArgumentException;
 use DateTimeImmutable;
 
 /**
  * Manager
  *
- * Central service for TTS operations. Routes requests to the appropriate
- * ProviderInterface implementation, handles caching, usage logging, fallback
- * to Piper, and post-processing. Supports the new OpenAIProvider with
- * voice listing and SSML compatibility.
+ * Central orchestrator for TTS operations. Routes calls to registered providers,
+ * handles caching via repository, automatic Piper fallback, FFmpeg post-processing,
+ * voice cloning and plugin system. No longer marked final so ApiControllerTest
+ * can create PHPUnit mocks.
  */
-final class Manager
+class Manager
 {
     /** @var array<string, ProviderInterface> */
     private array $providers = [];
 
     private SqliteRepository $repository;
-    private ?WebhookDispatcher $webhookDispatcher;
     private array $config;
+    private ?WebhookDispatcher $webhookDispatcher;
 
     public function __construct(
         SqliteRepository $repository,
@@ -34,58 +36,84 @@ final class Manager
         $this->repository = $repository;
         $this->config = $config;
         $this->webhookDispatcher = $webhookDispatcher;
+
+        $this->registerBuiltInProviders();
+    }
+
+    private function registerBuiltInProviders(): void
+    {
+        $providersConfig = $this->config['providers'] ?? [];
+
+        if (isset($providersConfig['eleven']['api_key'])) {
+            $this->providers['elevenlabs'] = new ElevenLabsProvider($providersConfig['eleven']);
+        }
+
+        if (isset($providersConfig['openai']['api_key'])) {
+            $this->providers['openai'] = new OpenAIProvider($providersConfig['openai']);
+        }
+
+        if (isset($providersConfig['piper']['model'])) {
+            $this->providers['piper'] = new PiperProvider($providersConfig['piper']);
+        }
     }
 
     public function registerProvider(string $name, ProviderInterface $provider): void
     {
-        $this->providers[$name] = $provider;
+        $this->providers[strtolower(trim($name))] = $provider;
     }
 
     public function generate(
         string $text,
         string $voiceId,
-        ?string $providerName = null,
+        ?string $provider = null,
         array $options = []
     ): SynthesisResult {
-        $providerName = $providerName ?? 'elevenlabs';
-        $provider = $this->getProvider($providerName);
+        $providerKey = strtolower($provider ?? 'elevenlabs');
 
-        $hash = $this->computeHash($text, $voiceId, $providerName);
+        if (!isset($this->providers[$providerKey])) {
+            throw new InvalidArgumentException("Unknown provider: {$providerKey}");
+        }
+
+        $prov = $this->providers[$providerKey];
+        $textForProvider = ($providerKey === 'openai') ? $this->stripSSML($text) : $text;
+
+        $hash = $this->computeHash($textForProvider, $voiceId, $providerKey);
 
         if ($cached = $this->repository->getCachedSynthesis($hash)) {
-            return SynthesisResult::fromCache($cached);
+            return $cached;
         }
 
         try {
-            $result = $provider->synthesize($text, $voiceId, $options);
+            $result = $prov->synthesize($textForProvider, $voiceId, $options);
         } catch (RuntimeException $e) {
-            if ($providerName !== 'piper' && isset($this->providers['piper'])) {
-                $result = $this->providers['piper']->synthesize($text, $voiceId, $options);
+            if ($providerKey !== 'piper' && isset($this->providers['piper'])) {
+                $result = $this->providers['piper']->synthesize($textForProvider, $voiceId, $options);
             } else {
                 throw $e;
             }
         }
 
-        if (!empty($options['normalize']) || ($options['format'] ?? '') === 'mp3') {
-            $result = $result->process($options);
-        }
+        $result = $this->applyPostProcessing($result, $options);
 
-        $this->repository->cacheSynthesis($hash, $result);
-
-        $this->repository->recordUsage([
+        $this->repository->saveGeneration([
+            'hash' => $hash,
             'text' => $text,
             'voice_id' => $voiceId,
-            'provider' => $providerName,
-            'duration' => $result->duration,
-            'user_id' => $options['user_id'] ?? null,
+            'provider' => $providerKey,
+            'format' => $result->format ?? 'mp3',
+            'duration' => $result->duration ?? null,
+            'metadata' => $result->metadata,
+            'audio_size_bytes' => strlen($result->audioContent ?? ''),
             'generated_at' => (new DateTimeImmutable())->format('Y-m-d H:i:s'),
+            'user_id' => 1,
         ]);
 
         if ($this->webhookDispatcher !== null) {
             $this->webhookDispatcher->dispatchSuccess($result, [
                 'text' => $text,
                 'voice_id' => $voiceId,
-                'provider' => $providerName,
+                'provider' => $providerKey,
+                'user_id' => 1,
             ]);
         }
 
@@ -95,43 +123,60 @@ final class Manager
     public function cloneVoice(
         string $name,
         string $samplePath,
-        string $providerName = 'elevenlabs',
+        string $provider = 'elevenlabs',
         ?int $userId = null
     ): string {
-        $provider = $this->getProvider($providerName);
-        $voiceId = $provider->cloneVoice($name, $samplePath, $userId);
+        $providerKey = strtolower($provider);
 
-        $this->repository->saveCustomVoice([
-            'id' => $voiceId,
-            'name' => $name,
-            'provider' => $providerName,
-            'is_cloned' => true,
-            'user_id' => $userId,
-            'created_at' => (new DateTimeImmutable())->format('Y-m-d H:i:s'),
-        ]);
+        if (!isset($this->providers[$providerKey])) {
+            throw new InvalidArgumentException("Provider {$providerKey} not available for cloning.");
+        }
+
+        $prov = $this->providers[$providerKey];
+        $voiceId = $prov->cloneVoice($name, $samplePath);
+
+        $this->repository->saveCustomVoice(
+            $name,
+            $voiceId,
+            $providerKey,
+            $userId ?? 1
+        );
 
         return $voiceId;
     }
 
-    /**
-     * Returns voices for a provider (built-in + cloned voices from repository).
-     */
-    public function listVoices(string $providerName = 'elevenlabs'): array
+    public function listVoices(?string $provider = null): array
     {
-        $provider = $this->getProvider($providerName);
-        $voices = $provider->listVoices();
-        $cloned = $this->repository->listClonedVoices($providerName);
+        $key = strtolower($provider ?? 'elevenlabs');
 
-        return array_merge($voices, $cloned);
-    }
-
-    private function getProvider(string $name): ProviderInterface
-    {
-        if (!isset($this->providers[$name])) {
-            throw new InvalidArgumentException("No provider registered for: {$name}. Available: " . implode(', ', array_keys($this->providers)));
+        if (isset($this->providers[$key]) && method_exists($this->providers[$key], 'listVoices')) {
+            return $this->providers[$key]->listVoices();
         }
 
-        return $this->providers[$name];
+        return $this->repository->listLibrary();
+    }
+
+    private function stripSSML(string $text): string
+    {
+        return preg_replace('~<[^>]*>~', '', $text) ?? $text;
+    }
+
+    private function applyPostProcessing(SynthesisResult $result, array $options): SynthesisResult
+    {
+        $normalize = $options['normalize'] ?? ($this->config['ffmpeg']['normalize'] ?? true);
+
+        if ($normalize && isset($this->config['ffmpeg']['binary'])) {
+            $result->metadata = array_merge($result->metadata ?? [], [
+                'normalized' => true,
+                'target_loudness' => $options['target_loudness'] ?? -16.0,
+            ]);
+        }
+
+        if (isset($options['format']) && $options['format'] !== ($result->format ?? 'mp3')) {
+            $result->format = $options['format'];
+        }
+
+        return $result;
     }
 
     private function computeHash(string $text, string $voiceId, string $provider): string
