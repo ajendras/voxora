@@ -6,189 +6,121 @@ namespace Voxora\Security;
 
 use DateTimeImmutable;
 use InvalidArgumentException;
+use Voxora\Storage\SqliteRepository;
 
 /**
  * KeyManager
  *
- * Handles issuance and validation of scoped, auto-expiring API tokens.
- * Tokens are self-contained encrypted payloads using Libsodium (sodium_crypto_secretbox).
- * This provides strong cryptographic security without requiring a DB lookup on every request.
- * Revocation can be added later via a token blacklist in the repository.
+ * Issues and validates encrypted, scoped, time-limited API tokens using libsodium.
+ * Tokens are self-contained (no DB lookup until revocation list is added).
+ * Prefix is "vxo_". Supports role and userId for RBAC.
  */
-final class KeyManager
+class KeyManager
 {
-    private string $encryptionKey;
-    private int $tokenLifetimeDays;
+    private const TOKEN_PREFIX = 'vxo_';
+    private string $secretKey;
 
-    /**
-     * @param string $encryptionKey Master key used to derive the 32-byte secretbox key.
-     *                              Should be a strong random secret (32+ characters).
-     * @param int $tokenLifetimeDays Default lifetime for issued tokens.
-     */
-    public function __construct(string $encryptionKey, int $tokenLifetimeDays = 90)
+    public function __construct(string $masterKey)
     {
-        if (strlen($encryptionKey) < 16) {
-            throw new InvalidArgumentException('Encryption key must be at least 16 characters for security.');
+        if (strlen($masterKey) < 8) {
+            throw new InvalidArgumentException('Master key must be at least 8 characters long.');
         }
-
-        $this->encryptionKey = $this->deriveKey($encryptionKey);
-        $this->tokenLifetimeDays = max(1, $tokenLifetimeDays);
+        // Derive 32-byte key for sodium_crypto_secretbox
+        $this->secretKey = hash('sha256', $masterKey, true);
     }
 
     /**
-     * Issue a new scoped API token.
-     *
-     * The token is returned only once. Store it securely on the client side.
-     * Audit logging of issuance should be performed by the caller.
-     *
-     * @param string $name Human-readable name for this token (e.g. "Mobile App Integration")
-     * @param array $scopes Permissions granted to this token. Use ['*'] for full access.
-     * @return string The token string (prefixed with "vxo_") to be distributed to the user.
+     * Issue a new encrypted token.
      */
-    public function issueToken(string $name, array $scopes = ['tts:generate']): string
-    {
-        $name = trim($name);
-        if ($name === '') {
-            throw new InvalidArgumentException('Token name cannot be empty.');
-        }
-
-        if (empty($scopes) || !is_array($scopes)) {
-            throw new InvalidArgumentException('At least one scope must be provided.');
-        }
-
-        $id = bin2hex(random_bytes(12));
-        $now = new DateTimeImmutable();
-        $expiresAt = $now->modify('+' . $this->tokenLifetimeDays . ' days');
+    public function issueToken(
+        string $name,
+        array $scopes = ['tts:generate'],
+        string $role = 'user',
+        ?int $userId = null,
+        ?DateTimeImmutable $expiresAt = null
+    ): string {
+        $expiresAt = $expiresAt ?? new DateTimeImmutable('+90 days');
 
         $payload = [
-            'id' => $id,
+            'id' => bin2hex(random_bytes(16)),
             'name' => $name,
-            'scopes' => array_values($scopes),
-            'iat' => $now->getTimestamp(),
+            'scopes' => $scopes,
+            'role' => $role,
+            'user_id' => $userId,
+            'iat' => time(),
             'exp' => $expiresAt->getTimestamp(),
         ];
 
-        $json = json_encode($payload, JSON_THROW_ON_ERROR);
-
         $nonce = random_bytes(SODIUM_CRYPTO_SECRETBOX_NONCEBYTES);
-        $ciphertext = sodium_crypto_secretbox($json, $nonce, $this->encryptionKey);
+        $json = json_encode($payload, JSON_THROW_ON_ERROR);
+        $encrypted = sodium_crypto_secretbox($json, $nonce, $this->secretKey);
+        $data = base64_encode($nonce . $encrypted);
 
-        $tokenBinary = $nonce . $ciphertext;
-        $encoded = base64_encode($tokenBinary);
-
-        return 'vxo_' . $encoded;
+        return self::TOKEN_PREFIX . $data;
     }
 
     /**
-     * Validate a presented token.
-     *
-     * Decrypts the payload, checks expiry, and returns a Token value object on success.
-     *
-     * @param string $token The full token (including "vxo_" prefix) from Authorization header.
-     * @return Token|null Null if token is malformed, tampered with, or expired.
+     * Validate a token string and return a Token object or null.
      */
-    public function validate(string $token): ?Token
+    public function validate(string $tokenString): ?Token
     {
-        if (!is_string($token) || !str_starts_with($token, 'vxo_')) {
+        if (!str_starts_with($tokenString, self::TOKEN_PREFIX)) {
             return null;
         }
 
-        $payload = substr($token, 4);
-        $decoded = base64_decode($payload, true);
+        $data = substr($tokenString, strlen(self::TOKEN_PREFIX));
+        $decoded = base64_decode($data, true);
 
-        if ($decoded === false) {
+        if ($decoded === false || strlen($decoded) < SODIUM_CRYPTO_SECRETBOX_NONCEBYTES) {
             return null;
         }
 
-        $nonceLength = SODIUM_CRYPTO_SECRETBOX_NONCEBYTES;
-        if (strlen($decoded) < $nonceLength + 16) { // minimum ciphertext size
-            return null;
-        }
+        $nonce = substr($decoded, 0, SODIUM_CRYPTO_SECRETBOX_NONCEBYTES);
+        $ciphertext = substr($decoded, SODIUM_CRYPTO_SECRETBOX_NONCEBYTES);
 
-        $nonce = substr($decoded, 0, $nonceLength);
-        $ciphertext = substr($decoded, $nonceLength);
-
-        $decrypted = sodium_crypto_secretbox_open($ciphertext, $nonce, $this->encryptionKey);
-
+        $decrypted = sodium_crypto_secretbox_open($ciphertext, $nonce, $this->secretKey);
         if ($decrypted === false) {
-            return null; // decryption failure = tampering or wrong key
-        }
-
-        try {
-            $data = json_decode($decrypted, true, 512, JSON_THROW_ON_ERROR);
-        } catch (\JsonException) {
             return null;
         }
 
-        if (!isset($data['id'], $data['name'], $data['scopes'], $data['exp'], $data['iat'])) {
+        $payload = json_decode($decrypted, true, 512, JSON_THROW_ON_ERROR);
+        if (!is_array($payload) || !isset($payload['exp']) || (int) $payload['exp'] < time()) {
             return null;
         }
-
-        $expiresAt = DateTimeImmutable::createFromFormat('U', (string) $data['exp']);
-        if ($expiresAt === false || $expiresAt < new DateTimeImmutable()) {
-            return null;
-        }
-
-        $issuedAt = DateTimeImmutable::createFromFormat('U', (string) $data['iat']) ?: new DateTimeImmutable();
 
         return new Token(
-            $data['id'],
-            $data['name'],
-            (array) $data['scopes'],
-            $issuedAt,
-            $expiresAt
+            id: $payload['id'] ?? '',
+            name: $payload['name'] ?? '',
+            scopes: $payload['scopes'] ?? [],
+            role: $payload['role'] ?? 'user',
+            userId: $payload['user_id'] ?? null,
+            expiresAt: (new DateTimeImmutable())->setTimestamp((int) $payload['exp'])
         );
-    }
-
-    /**
-     * Derives a 32-byte key suitable for sodium_crypto_secretbox from the user-provided key.
-     */
-    private function deriveKey(string $rawKey): string
-    {
-        if (strlen($rawKey) === SODIUM_CRYPTO_SECRETBOX_KEYBYTES) {
-            return $rawKey;
-        }
-
-        return sodium_crypto_generichash($rawKey, '', SODIUM_CRYPTO_SECRETBOX_KEYBYTES);
     }
 }
 
 /**
- * Token
- *
- * Immutable value object representing a validated API token.
+ * Token value object.
  */
-final class Token
+class Token
 {
-    /**
-     * @param string[] $scopes
-     */
     public function __construct(
         public readonly string $id,
         public readonly string $name,
         public readonly array $scopes,
-        public readonly DateTimeImmutable $issuedAt,
+        public readonly string $role,
+        public readonly ?int $userId,
         public readonly DateTimeImmutable $expiresAt
     ) {
+    }
+
+    public function hasScope(string $scope): bool
+    {
+        return in_array($scope, $this->scopes, true);
     }
 
     public function isExpired(): bool
     {
         return $this->expiresAt < new DateTimeImmutable();
-    }
-
-    public function hasScope(string $scope): bool
-    {
-        if (in_array('*', $this->scopes, true)) {
-            return true;
-        }
-
-        foreach ($this->scopes as $granted) {
-            if ($granted === $scope || str_starts_with($scope . ':', $granted . ':')) {
-                return true;
-            }
-        }
-
-        return false;
     }
 }

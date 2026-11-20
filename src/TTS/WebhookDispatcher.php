@@ -5,63 +5,66 @@ declare(strict_types=1);
 namespace Voxora\TTS;
 
 use GuzzleHttp\Client;
-use GuzzleHttp\Exception\GuzzleException;
-use Psr\Log\LoggerInterface;
+use RuntimeException;
 
 /**
  * WebhookDispatcher
  *
- * Notifies external systems via HTTP POST when synthesis completes successfully.
- * Configured via config['webhook']['url']. Silently fails on network issues to
- * not block the main flow (fails-open design).
+ * Dispatches success notifications to a configured webhook URL.
+ * Used by Manager, ApiController, BatchGenerator and PiperProvider.
+ * Fails open on any error (network, config, JSON, etc).
  */
-final class WebhookDispatcher
+class WebhookDispatcher
 {
-    private ?Client $client = null;
-    private ?string $webhookUrl;
-    private ?LoggerInterface $logger;
+    private array $config;
 
-    public function __construct(?string $webhookUrl = null, ?LoggerInterface $logger = null)
+    public function __construct(array $config = [])
     {
-        $this->webhookUrl = $webhookUrl;
-        $this->logger = $logger;
-
-        if ($this->webhookUrl !== null) {
-            $this->client = new Client([
-                'timeout' => 10,
-                'http_version' => 2.0,
-            ]);
-        }
+        $this->config = $config;
     }
 
+    /**
+     * Notify external system of a successful synthesis.
+     */
     public function dispatchSuccess(SynthesisResult $result, array $context = []): void
     {
-        if ($this->client === null || $this->webhookUrl === null) {
+        $url = $this->config['webhook_url'] ?? $this->config['webhook']['url'] ?? null;
+        if (empty($url) || !filter_var($url, FILTER_VALIDATE_URL)) {
             return;
         }
 
-        $payload = array_merge([
-            'event' => 'synthesis.completed',
-            'timestamp' => date('c'),
-            'duration_seconds' => $result->duration,
-            'format' => $result->format,
-            'provider' => $result->metadata['provider'] ?? 'unknown',
-            'text_preview' => substr($context['text'] ?? '', 0, 100),
-        ], $context);
+        $payload = [
+            'event' => 'synthesis.success',
+            'timestamp' => (new \DateTimeImmutable())->format('c'),
+            'result' => [
+                'duration' => $result->duration ?? null,
+                'format' => $result->format ?? 'mp3',
+                'metadata' => $result->metadata ?? [],
+            ],
+            'context' => array_merge([
+                'text_preview' => substr($context['text'] ?? '', 0, 80),
+                'provider' => $context['provider'] ?? 'unknown',
+                'voice_id' => $context['voice_id'] ?? '',
+                'user_id' => $context['user_id'] ?? null,
+                'batch' => $context['batch'] ?? false,
+                'scheduled' => $context['scheduled'] ?? false,
+            ], $context),
+        ];
 
         try {
-            $this->client->post($this->webhookUrl, [
+            $client = new Client([
+                'timeout' => 5,
+                'connect_timeout' => 2,
+            ]);
+
+            $client->post($url, [
                 'json' => $payload,
                 'headers' => [
                     'User-Agent' => 'Voxora-Webhook/1.0',
                 ],
             ]);
-        } catch (GuzzleException $e) {
-            $this->logger?->warning('Webhook delivery failed', [
-                'url' => $this->webhookUrl,
-                'error' => $e->getMessage(),
-            ]);
-            // fails open - does not throw
+        } catch (\Throwable $e) {
+            // fail open - never throw from a webhook
         }
     }
 }
