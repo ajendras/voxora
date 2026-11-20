@@ -662,7 +662,7 @@ The test suite covers `KeyManager` token issuance, validation, expiry checks, en
 - [x] Implement built-in OpenAI TTS provider with voice listing and SSML support
 - [x] Add web UI page for listing/editing/deleting scheduled batch jobs with status
 - [x] Expand test coverage with integration tests for ApiController endpoints
-- [ ] Implement token revocation list in KeyManager with SQLite persistence
+- [x] Implement token revocation list in KeyManager with SQLite persistence
 - [ ] Add pagination and filters to generation history view and API endpoint
 - [ ] Provide official Docker Compose file with Redis, Piper and example voices
 - [ ] Write dedicated guide for implementing and registering custom TTS providers

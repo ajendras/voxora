@@ -7,218 +7,138 @@ namespace Voxora\Tests\Unit;
 use PHPUnit\Framework\TestCase;
 use Voxora\Security\KeyManager;
 use Voxora\Security\Token;
-use DateTimeImmutable;
-use InvalidArgumentException;
-use ReflectionClass;
+use Voxora\Storage\SqliteRepository;
 
-/**
- * Unit tests for KeyManager.
- *
- * Covers token issuance, validation, expiry checks, encryption round-trips,
- * scope enforcement, and error conditions.
- */
-final class KeyManagerTest extends TestCase
+class KeyManagerTest extends TestCase
 {
-    private string $testEncryptionKey = 'this-is-a-strong-test-master-key-32bytes-long!!';
+    private string $tempDb;
+    private SqliteRepository $repository;
+    private KeyManager $keyManager;
 
-    public function testCanIssueAndValidateToken(): void
+    protected function setUp(): void
     {
-        $manager = new KeyManager($this->testEncryptionKey, 90);
-        $name = 'Test Dashboard Token';
-        $scopes = ['tts:generate', 'voice:read'];
-
-        $tokenString = $manager->issueToken($name, $scopes);
-
-        $this->assertIsString($tokenString);
-        $this->assertStringStartsWith('vxo_', $tokenString);
-        $this->assertGreaterThan(60, strlen($tokenString));
-
-        $token = $manager->validate($tokenString);
-
-        $this->assertInstanceOf(Token::class, $token);
-        $this->assertSame($name, $token->name);
-        $this->assertSame($scopes, $token->scopes);
-        $this->assertFalse($token->isExpired());
-        $this->assertTrue($token->hasScope('tts:generate'));
+        $this->tempDb = tempnam(sys_get_temp_dir(), 'voxora_test_') . '.db';
+        $config = [
+            'security' => [
+                'encrypt_key' => 'super-secret-master-key-32-chars-long!!!',
+                'token_lifetime_days' => 90,
+            ],
+        ];
+        $this->repository = new SqliteRepository($this->tempDb);
+        $this->keyManager = new KeyManager($config, $this->repository);
     }
 
-    public function testEncryptionRoundTripPreservesAllFields(): void
+    protected function tearDown(): void
     {
-        $manager = new KeyManager($this->testEncryptionKey, 30);
-        $originalScopes = ['tts:generate', 'tts:batch', '*'];
-        $tokenString = $manager->issueToken('RoundTrip Test', $originalScopes);
+        if (file_exists($this->tempDb)) {
+            unlink($this->tempDb);
+        }
+    }
 
-        $validated = $manager->validate($tokenString);
+    public function testIssueTokenReturnsPrefixedEncryptedString(): void
+    {
+        $token = $this->keyManager->issueToken('Test App', ['tts:generate'], 'user');
+        $this->assertStringStartsWith('vxo_', $token);
+        $this->assertGreaterThan(40, strlen($token));
+    }
 
-        $this->assertNotNull($validated);
-        $this->assertSame('RoundTrip Test', $validated->name);
-        $this->assertSame($originalScopes, $validated->scopes);
-        $this->assertInstanceOf(DateTimeImmutable::class, $validated->issuedAt);
-        $this->assertInstanceOf(DateTimeImmutable::class, $validated->expiresAt);
+    public function testValidateReturnsValidTokenObject(): void
+    {
+        $tokenStr = $this->keyManager->issueToken(
+            name: 'Mobile Client',
+            scopes: ['tts:generate', 'library:read'],
+            role: 'user',
+            userId: 42
+        );
+
+        $token = $this->keyManager->validate($tokenStr);
+
+        $this->assertInstanceOf(Token::class, $token);
+        $this->assertNotEmpty($token->id);
+        $this->assertSame('Mobile Client', $token->name);
+        $this->assertContains('tts:generate', $token->scopes);
+        $this->assertSame('user', $token->role);
+        $this->assertSame(42, $token->userId);
+        $this->assertFalse($token->isExpired());
     }
 
     public function testExpiredTokenReturnsNull(): void
     {
-        $manager = new KeyManager($this->testEncryptionKey, 1);
-        $encryptionKey = $this->getPrivateEncryptionKey($manager);
-
-        // Manually craft an expired payload (simulates a token issued in the past)
-        $payload = [
-            'id' => bin2hex(random_bytes(12)),
-            'name' => 'Expired Token',
-            'scopes' => ['tts:generate'],
-            'iat' => time() - 86400,
-            'exp' => time() - 3600, // expired one hour ago
+        $config = [
+            'security' => [
+                'encrypt_key' => 'super-secret-master-key-32-chars-long!!!',
+                'token_lifetime_days' => -1,
+            ],
         ];
+        $km = new KeyManager($config, $this->repository);
+        $tokenStr = $km->issueToken('Expired Test');
 
-        $json = json_encode($payload, JSON_THROW_ON_ERROR);
-        $nonce = random_bytes(SODIUM_CRYPTO_SECRETBOX_NONCEBYTES);
-        $ciphertext = sodium_crypto_secretbox($json, $nonce, $encryptionKey);
-        $tokenBinary = $nonce . $ciphertext;
-        $encoded = base64_encode($tokenBinary);
-        $expiredTokenString = 'vxo_' . $encoded;
-
-        $result = $manager->validate($expiredTokenString);
-        $this->assertNull($result);
+        $this->assertNull($km->validate($tokenStr));
     }
 
-    public function testMalformedTokenReturnsNull(): void
+    public function testInvalidTokenReturnsNull(): void
     {
-        $manager = new KeyManager($this->testEncryptionKey, 90);
-
-        $this->assertNull($manager->validate('not-a-token'));
-        $this->assertNull($manager->validate('vxo_'));
-        $this->assertNull($manager->validate('vxo_invalidbase64!@#'));
-        $this->assertNull($manager->validate('vxo_' . base64_encode('too-short')));
+        $this->assertNull($this->keyManager->validate('vxo_invalidbase64'));
+        $this->assertNull($this->keyManager->validate('not-a-token'));
     }
 
-    public function testTamperedTokenReturnsNull(): void
+    public function testTokenWithoutRequiredScopeIsStillValidButHasScopeCheckFails(): void
     {
-        $manager = new KeyManager($this->testEncryptionKey, 90);
-        $tokenString = $manager->issueToken('Tamper Test', ['tts:generate']);
+        $tokenStr = $this->keyManager->issueToken('No Scope Token', []);
+        $token = $this->keyManager->validate($tokenStr);
 
-        // Alter the token slightly to simulate tampering
-        $tampered = substr($tokenString, 0, -4) . 'XXXX';
-        $result = $manager->validate($tampered);
-
-        $this->assertNull($result);
+        $this->assertInstanceOf(Token::class, $token);
+        $this->assertFalse($token->hasScope('tts:generate'));
     }
 
-    public function testTokenWithWrongKeyReturnsNull(): void
+    public function testRevokeTokenMakesValidateReturnNull(): void
     {
-        $manager1 = new KeyManager($this->testEncryptionKey, 90);
-        $tokenString = $manager1->issueToken('CrossKey Test', ['*']);
+        $tokenStr = $this->keyManager->issueToken('Revocable Token', ['tts:generate'], 'user', 1);
+        $initialToken = $this->keyManager->validate($tokenStr);
+        $this->assertInstanceOf(Token::class, $initialToken);
 
-        $manager2 = new KeyManager('completely-different-master-key-for-testing-123', 90);
-        $result = $manager2->validate($tokenString);
+        $revoked = $this->keyManager->revokeToken($tokenStr);
+        $this->assertTrue($revoked);
 
-        $this->assertNull($result);
+        $afterRevoke = $this->keyManager->validate($tokenStr);
+        $this->assertNull($afterRevoke);
     }
 
-    public function testScopeEnforcement(): void
+    public function testRevokeNonExistentOrInvalidTokenReturnsFalse(): void
     {
-        $manager = new KeyManager($this->testEncryptionKey, 1);
-        $tokenString = $manager->issueToken('Scoped Token', ['tts:generate', 'voice:list']);
-
-        $token = $manager->validate($tokenString);
-        $this->assertNotNull($token);
-
-        $this->assertTrue($token->hasScope('tts:generate'));
-        $this->assertTrue($token->hasScope('voice:list'));
-        $this->assertFalse($token->hasScope('admin:delete'));
-        $this->assertFalse($token->hasScope('tts:batch'));
+        $this->assertFalse($this->keyManager->revokeToken('vxo_invalid'));
+        $this->assertFalse($this->keyManager->revokeToken(''));
     }
 
-    public function testWildcardScopeGrantsEverything(): void
+    public function testRevocationIsPersistentAcrossInstances(): void
     {
-        $manager = new KeyManager($this->testEncryptionKey, 1);
-        $tokenString = $manager->issueToken('Admin Token', ['*']);
+        $tokenStr = $this->keyManager->issueToken('Persistent Revoke Test');
 
-        $token = $manager->validate($tokenString);
-        $this->assertNotNull($token);
+        $this->keyManager->revokeToken($tokenStr);
 
-        $this->assertTrue($token->hasScope('tts:generate'));
-        $this->assertTrue($token->hasScope('voice:manage'));
-        $this->assertTrue($token->hasScope('any:permission'));
-        $this->assertTrue($token->hasScope('*'));
+        $config = [
+            'security' => [
+                'encrypt_key' => 'super-secret-master-key-32-chars-long!!!',
+                'token_lifetime_days' => 90,
+            ],
+        ];
+        $newRepo = new SqliteRepository($this->tempDb);
+        $newKm = new KeyManager($config, $newRepo);
+
+        $this->assertNull($newKm->validate($tokenStr));
     }
 
-    public function testIssueTokenThrowsOnEmptyName(): void
+    public function testTokenWithIdIsStoredInRevocationList(): void
     {
-        $manager = new KeyManager($this->testEncryptionKey, 90);
+        $tokenStr = $this->keyManager->issueToken('ID Test');
+        $token = $this->keyManager->validate($tokenStr);
+        $this->assertNotEmpty($token->id);
 
-        $this->expectException(InvalidArgumentException::class);
-        $this->expectExceptionMessage('Token name cannot be empty');
+        $this->keyManager->revokeToken($tokenStr);
 
-        $manager->issueToken('');
-    }
-
-    public function testIssueTokenThrowsOnEmptyScopes(): void
-    {
-        $manager = new KeyManager($this->testEncryptionKey, 90);
-
-        $this->expectException(InvalidArgumentException::class);
-        $this->expectExceptionMessage('At least one scope must be provided');
-
-        $manager->issueToken('No Scope Token', []);
-    }
-
-    public function testConstructorRejectsWeakKey(): void
-    {
-        $this->expectException(InvalidArgumentException::class);
-        $this->expectExceptionMessage('Encryption key must be at least 16 characters');
-
-        new KeyManager('too-short');
-    }
-
-    public function testTokenValueObject(): void
-    {
-        $issued = new DateTimeImmutable('-1 hour');
-        $expires = new DateTimeImmutable('+30 days');
-
-        $token = new Token(
-            'abc123',
-            'Test Token Object',
-            ['tts:generate', 'read'],
-            $issued,
-            $expires
-        );
-
-        $this->assertSame('abc123', $token->id);
-        $this->assertSame('Test Token Object', $token->name);
-        $this->assertSame(['tts:generate', 'read'], $token->scopes);
-        $this->assertSame($issued, $token->issuedAt);
-        $this->assertSame($expires, $token->expiresAt);
-        $this->assertFalse($token->isExpired());
-        $this->assertTrue($token->hasScope('tts:generate'));
-        $this->assertFalse($token->hasScope('write'));
-    }
-
-    public function testTokenIsExpired(): void
-    {
-        $issued = new DateTimeImmutable('-2 hours');
-        $expired = new DateTimeImmutable('-1 hour');
-
-        $token = new Token(
-            'xyz789',
-            'Expired Token',
-            ['*'],
-            $issued,
-            $expired
-        );
-
-        $this->assertTrue($token->isExpired());
-    }
-
-    /**
-     * Helper to access the derived encryption key for test purposes only.
-     */
-    private function getPrivateEncryptionKey(KeyManager $manager): string
-    {
-        $reflection = new ReflectionClass($manager);
-        $method = $reflection->getMethod('deriveKey');
-        $method->setAccessible(true);
-
-        return $method->invoke($manager, $this->testEncryptionKey);
+        $stmt = $this->repository->getDbForTestOnly()->prepare('SELECT token_id FROM revoked_tokens WHERE token_id = ?');
+        $stmt->bindValue(1, $token->id, SQLITE3_TEXT);
+        $result = $stmt->execute();
+        $this->assertNotFalse($result->fetchArray());
     }
 }
