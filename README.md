@@ -463,6 +463,15 @@ curl -X POST http://localhost:8080/api/v1/speech \
 
 Provider can be set to `piper` for local synthesis or `openai` (uses alloy by default). Use `/api/v1/clone-voice` for cloning. SSML inside the `text` field is passed through to the provider (stripped for OpenAI). New fields control FFmpeg processing. Use `manager->listVoices('openai')` to retrieve the six standard OpenAI voices programmatically.
 
+**History endpoint (with pagination + filters)**
+
+```bash
+curl -H "X-Api-Key: vxo_..." \
+  "http://localhost:8080/api/v1/history?page=1&per_page=15&search=hello&provider=elevenlabs&date_from=2025-01-01&date_to=2025-01-31"
+```
+
+Response includes the generation list plus a `pagination` object (`current_page`, `total_pages`, `total_items`, `per_page`, `has_next`, `has_prev`) and applied `filters`. The dashboard history view mirrors these filters with an HTMX-powered form and Tailwind pagination controls.
+
 ### Voice Library Export & Import
 
 The voice library (curated voices + any cloned voices you have added) can be exported and imported as a portable, versioned JSON bundle. The bundle is self-describing and can be saved, shared, backed up, or imported into another Voxora instance.
@@ -554,8 +563,8 @@ flowchart TD
     Kernel --> Router[Router]
     Kernel --> Redis[Predis Client]
     Kernel --> RateLimiter[RateLimiter (Redis incr/expire)]
-    Router --> Dashboard[DashboardController<br>(login, index, generate, library, jobs)]
-    Router --> Api[ApiController<br>(cloneVoiceAction, importLibraryAction)]
+    Router --> Dashboard[DashboardController<br>(login, index, generate, library, jobs, history)]
+    Router --> Api[ApiController<br>(cloneVoiceAction, importLibraryAction, historyAction)]
     Api --> RateLimiter
     Dashboard --> RateLimiter
     Api --> KeyManager[KeyManager::validate<br>(role + userId)]
@@ -586,9 +595,11 @@ flowchart TD
     ImportBundle[JSON Bundle Upload] --> Api.importLibraryAction
     ImportBundle --> Dashboard.libraryAction
     Api.importLibraryAction --> Repo.importLibrary
+    Repo --> History[Paginated + filtered history<br>(getHistory with page/filters)]
+    Dashboard --> History
 ```
 
-`Kernel` wires together `KeyManager`, `TTS\Manager`, `SqliteRepository` and the two controllers. All synthesis paths converge on `Manager::generate()`, which selects a `ProviderInterface` implementation, caches results and records usage. The dashboard uses HTMX fragments while the API returns JSON with public audio URLs. Sessions + `users` table enable multi-user isolation and role checks (`admin` vs `user`). Piper is used as automatic fallback for offline/resilient operation. Voice cloning is handled by `Manager::cloneVoice()` which delegates to the provider, stores the voice, and makes it available in `listLibrary()`. The new SSML editor lives inside `DashboardController::renderSynthPanel()` with pure-JS tag insertion that feeds directly into the existing HTMX generation flow. **FFmpeg integration lives in `SynthesisResult::process()`** and is invoked automatically by `Manager`. The analytics dashboard is rendered server-side with Chart.js consuming JSON data produced by `SqliteRepository::getUsageStats()` (including automatic date-gap filling). **RateLimiter** sits in front of protected actions and uses Redis counters (per-user or per-IP) to enforce throttling. The plugin system lives in `Manager::registerProvider()` and is populated at boot by `Kernel`; any `ProviderInterface` can be added at runtime and is automatically surfaced in the UI, API and batch runner. The new `Scheduler` (with embedded `CronExpression` parser) reads from the `scheduled_jobs` table, evaluates due jobs, calls `BatchGenerator`, updates last-run timestamps and logs activity. It is intended to be executed by native system cron. The UI layer now includes a persistent theme engine (localStorage + Tailwind `dark` class on `<html>`) and accessibility enhancements throughout all rendered markup and fragments. The voice library export lives in `SqliteRepository::exportLibrary()` (returns a versioned array) and is exposed via a new `ApiController::exportLibraryAction()` endpoint. The new import support lives in `SqliteRepository::importLibrary()`, `ApiController::importLibraryAction()` and `DashboardController::libraryAction()` (POST handling + HTMX fragment). The new `OpenAIProvider` implements voice listing (static list of the six standard voices) and gracefully strips SSML tags before calling the OpenAI `/audio/speech` endpoint. The new jobs UI is fully integrated into `DashboardController::jobsAction()` with forms, HTMX actions and status badges powered by the expanded repository and scheduler methods.
+`Kernel` wires together `KeyManager`, `TTS\Manager`, `SqliteRepository` and the two controllers. All synthesis paths converge on `Manager::generate()`, which selects a `ProviderInterface` implementation, caches results and records usage. The dashboard uses HTMX fragments while the API returns JSON with public audio URLs. Sessions + `users` table enable multi-user isolation and role checks (`admin` vs `user`). Piper is used as automatic fallback for offline/resilient operation. Voice cloning is handled by `Manager::cloneVoice()` which delegates to the provider, stores the voice, and makes it available in `listLibrary()`. The new SSML editor lives inside `DashboardController::renderSynthPanel()` with pure-JS tag insertion that feeds directly into the existing HTMX generation flow. **FFmpeg integration lives in `SynthesisResult::process()`** and is invoked automatically by `Manager`. The analytics dashboard is rendered server-side with Chart.js consuming JSON data produced by `SqliteRepository::getUsageStats()` (including automatic date-gap filling). **RateLimiter** sits in front of protected actions and uses Redis counters (per-user or per-IP) to enforce throttling. The plugin system lives in `Manager::registerProvider()` and is populated at boot by `Kernel`; any `ProviderInterface` can be added at runtime and is automatically surfaced in the UI, API and batch runner. The new `Scheduler` (with embedded `CronExpression` parser) reads from the `scheduled_jobs` table, evaluates due jobs, calls `BatchGenerator`, updates last-run timestamps and logs activity. It is intended to be executed by native system cron. The UI layer now includes a persistent theme engine (localStorage + Tailwind `dark` class on `<html>`) and accessibility enhancements throughout all rendered markup and fragments. The voice library export lives in `SqliteRepository::exportLibrary()` (returns a versioned array) and is exposed via a new `ApiController::exportLibraryAction()` endpoint. The new import support lives in `SqliteRepository::importLibrary()`, `ApiController::importLibraryAction()` and `DashboardController::libraryAction()` (POST handling + HTMX fragment). The new `OpenAIProvider` implements voice listing (static list of the six standard voices) and gracefully strips SSML tags before calling the OpenAI `/audio/speech` endpoint. The new jobs UI is fully integrated into `DashboardController::jobsAction()` with forms, HTMX actions and status badges powered by the expanded repository and scheduler methods. **History now supports server-side pagination and multiple filters** via `SqliteRepository::getHistory(array $params)` (used by both API and dashboard HTMX view).
 
 ## 📁 Project structure
 
@@ -610,10 +621,10 @@ flowchart TD
 │   │   ├── SynthesisResult.php   # common result value object (mp3/wav) with FFmpeg process()
 │   │   └── Manager.php           # generate() with caching, usage recording & Piper fallback; cloneVoice(); registerProvider() plugin system; listVoices()
 │   ├── Http/
-│   │   ├── DashboardController.php # HTMX pages + generateAction + login/logout + rich SSML editor + analytics + library import + jobs UI
-│   │   └── ApiController.php     # speechAction, historyAction, issueTokenAction, cloneVoiceAction, importLibraryAction (role-aware)
+│   │   ├── DashboardController.php # HTMX pages + generateAction + login/logout + rich SSML editor + analytics + library import + jobs UI + history with pagination/filters
+│   │   └── ApiController.php     # speechAction, historyAction (now with pagination + filters), issueTokenAction, cloneVoiceAction, importLibraryAction (role-aware)
 │   ├── Storage/
-│   │   └── SqliteRepository.php  # schema (users + voices with is_cloned + scheduled_jobs), analytics queries, getUsageStats() with Chart.js data, importLibrary(), job CRUD
+│   │   └── SqliteRepository.php  # schema (users + voices with is_cloned + scheduled_jobs), analytics queries, getUsageStats() with Chart.js data, importLibrary(), job CRUD, getHistory with pagination/filters
 │   └── Automation/
 │       ├── BatchGenerator.php    # run(csvPath, progress), Report value object
 │       └── Scheduler.php         # CronExpression parser + Scheduler for recurring jobs (list, edit, delete, runJob, runDue)
@@ -640,7 +651,7 @@ PHPUnit is configured via `phpunit.xml.dist` (disables the result cache to avoid
 
 The test suite covers `KeyManager` token issuance, validation, expiry checks, encryption round-trips, scope enforcement and the new role/userId fields. `PiperProviderTest` validates WAV duration extraction from the RIFF header (using a mocked Symfony Process for reliable CI runs), confirms `cloneVoice()` throws as expected, exercises the new `listVoices()` implementation, and exercises `WebhookDispatcher` with Piper results. RateLimiter behavior (allowed/blocked windows, mock Redis interactions) is covered inside `KeyManagerTest`. New tests cover the plugin registration API and resolution of custom providers. The OpenAIProvider is exercised through Manager integration tests. `SchedulerTest` exercises `CronExpression::isDue()` for common patterns and the full scheduler flow with mocked repository and batch generator. Additional coverage was added for the new `runJob()`, `updateJob()` and `deleteJob()` methods used by the web UI.
 
-**New:** `ApiControllerTest` provides integration-style tests for every endpoint. It uses PHPUnit mocks for `KeyManager`, `Manager`, `SqliteRepository`, `RateLimiter`, `WebhookDispatcher` and `Token` (these classes are no longer marked final) to test authentication flows, rate-limit enforcement (both token and IP), input validation errors, successful JSON responses, voice cloning (with simulated file upload), library export, history retrieval and proper error status codes (401, 400, 429). This brings the API coverage to >95% and ensures regressions are caught early.
+**New:** `ApiControllerTest` provides integration-style tests for every endpoint. It uses PHPUnit mocks for `KeyManager`, `Manager`, `SqliteRepository`, `RateLimiter`, `WebhookDispatcher` and `Token` (these classes are no longer marked final) to test authentication flows, rate-limit enforcement (both token and IP), input validation errors, successful JSON responses, voice cloning (with simulated file upload), library export, history retrieval and proper error status codes (401, 400, 429). This brings the API coverage to >95% and ensures regressions are caught early. Tests were extended to cover the new pagination and filter parameters on the history endpoint.
 
 ## 📍 Roadmap
 
@@ -663,7 +674,7 @@ The test suite covers `KeyManager` token issuance, validation, expiry checks, en
 - [x] Add web UI page for listing/editing/deleting scheduled batch jobs with status
 - [x] Expand test coverage with integration tests for ApiController endpoints
 - [x] Implement token revocation list in KeyManager with SQLite persistence
-- [ ] Add pagination and filters to generation history view and API endpoint
+- [x] Add pagination and filters to generation history view and API endpoint
 - [ ] Provide official Docker Compose file with Redis, Piper and example voices
 - [ ] Write dedicated guide for implementing and registering custom TTS providers
 
