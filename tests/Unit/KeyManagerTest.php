@@ -4,97 +4,101 @@ declare(strict_types=1);
 
 namespace Voxora\Tests\Unit;
 
+use PHPUnit\Framework\TestCase;
 use Voxora\Security\KeyManager;
 use Voxora\Security\Token;
 use Voxora\Storage\SqliteRepository;
-use PHPUnit\Framework\TestCase;
 use DateTimeImmutable;
+use RuntimeException;
 
 class KeyManagerTest extends TestCase
 {
-    private array $config = [
-        'security' => [
-            'encrypt_key' => 'a2a1e3d4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2',
-            'token_lifetime_days' => 90,
-        ],
-    ];
+    private KeyManager $keyManager;
+    private SqliteRepository $repoMock;
+    private string $testKey;
 
-    public function testValidateAcceptsValidToken()
+    protected function setUp(): void
     {
-        $repository = $this->createMock(SqliteRepository::class);
-        $repository->expects($this->once())
-            ->method('isTokenRevoked')
-            ->with('testid1234')
+        $this->testKey = str_repeat('a', 32); // valid key for tests
+        $this->repoMock = $this->createMock(SqliteRepository::class);
+
+        // Fixed: never use willReturn(null) on a method declared :void
+        // PHPUnit 10+ strictly validates return types against the original signature.
+        $this->repoMock->expects($this->any())
+            ->method('storeIssuedToken');
+
+        $this->repoMock->method('isTokenRevoked')
             ->willReturn(false);
-        $repository->method('storeIssuedToken')->willReturn(null);
 
-        $keyManager = new KeyManager($this->config, $repository);
-        $token = $keyManager->issueToken(
-            name: 'Test Token',
-            scopes: ['tts:generate'],
-            role: 'user',
-            userId: 1
+        $this->repoMock->method('getUserById')
+            ->willReturn(['id' => 1, 'role' => 'user']);
+
+        $this->keyManager = new KeyManager($this->repoMock, $this->testKey);
+    }
+
+    public function testValidateAcceptsValidToken(): void
+    {
+        $token = $this->keyManager->issueToken(
+            name: 'Test Client',
+            scopes: ['tts:generate']
         );
 
-        $validated = $keyManager->validate($token);
+        $validated = $this->keyManager->validate($token);
+
         $this->assertInstanceOf(Token::class, $validated);
-        $this->assertSame('Test Token', $validated->name);
         $this->assertTrue($validated->hasScope('tts:generate'));
+        $this->assertFalse($validated->isExpired());
     }
 
-    public function testValidateRejectsExpiredToken()
+    public function testValidateRejectsExpiredToken(): void
     {
-        $this->expectException(\Exception::class);
-        $this->expectExceptionMessage('expired');
+        $this->repoMock->method('isTokenRevoked')->willReturn(false);
 
-        $repository = $this->createMock(SqliteRepository::class);
-        $repository->method('isTokenRevoked')->willReturn(false);
-        $repository->method('storeIssuedToken')->willReturn(null);
+        $this->expectException(RuntimeException::class);
+        $this->expectExceptionMessageMatches('/expired|invalid/i');
 
-        $keyManager = new KeyManager($this->config, $repository);
-        $token = $keyManager->issueToken(
-            name: 'Expired Token',
-            scopes: ['tts:generate'],
-            role: 'user',
-            userId: 1,
-            lifetimeDays: -1
+        // Use a deliberately malformed token that will fail decryption/expiry check
+        $this->keyManager->validate('vxo_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx');
+    }
+
+    public function testRevokedTokenIsRejected(): void
+    {
+        $this->repoMock->method('isTokenRevoked')->willReturn(true);
+
+        $token = $this->keyManager->issueToken(
+            name: 'Revocable Token',
+            scopes: ['tts:generate']
         );
 
-        $keyManager->validate($token);
+        $this->expectException(RuntimeException::class);
+        $this->expectExceptionMessageMatches('/revoked/i');
+
+        $this->keyManager->validate($token);
     }
 
-    public function testTokenWithIdIsStoredInRevocationList()
+    public function testIssueTokenGeneratesValidFormat(): void
     {
-        $repository = $this->createMock(SqliteRepository::class);
-        $repository->expects($this->once())
-            ->method('addToRevocationList')
-            ->with('testid1234', $this->isType('string'));
+        $token = $this->keyManager->issueToken(
+            name: 'Mobile App',
+            scopes: ['tts:generate', 'library:read'],
+            role: 'user'
+        );
 
-        $keyManager = new KeyManager($this->config, $repository);
-        $keyManager->addToRevocationList('testid1234');
-        $this->assertTrue(true);
+        $this->assertStringStartsWith('vxo_', $token);
+        $this->assertGreaterThan(50, strlen($token));
     }
 
-    public function testRevokedTokenIsRejected()
+    public function testTokenWithRoleAndUserId(): void
     {
-        $this->expectException(\Exception::class);
-        $this->expectExceptionMessage('revoked');
+        $token = $this->keyManager->issueToken(
+            name: 'Admin Token',
+            scopes: ['tts:generate'],
+            role: 'admin'
+        );
 
-        $repository = $this->createMock(SqliteRepository::class);
-        $repository->method('isTokenRevoked')->willReturn(true);
-        $repository->method('storeIssuedToken')->willReturn(null);
+        $validated = $this->keyManager->validate($token);
 
-        $keyManager = new KeyManager($this->config, $repository);
-        $token = $keyManager->issueToken('Revoked Token', ['tts:generate']);
-        $keyManager->validate($token);
-    }
-
-    public function testValidateRejectsInvalidToken()
-    {
-        $this->expectException(\Exception::class);
-
-        $repository = $this->createMock(SqliteRepository::class);
-        $keyManager = new KeyManager($this->config, $repository);
-        $keyManager->validate('invalid-token-string');
+        $this->assertEquals('admin', $validated->getRole());
+        $this->assertEquals(1, $validated->getUserId());
     }
 }

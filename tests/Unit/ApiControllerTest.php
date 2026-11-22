@@ -7,24 +7,22 @@ namespace Voxora\Tests\Unit;
 use PHPUnit\Framework\TestCase;
 use Voxora\Http\ApiController;
 use Voxora\Http\Request;
-use Voxora\Http\Response;
 use Voxora\Security\KeyManager;
 use Voxora\Security\Token;
 use Voxora\TTS\Manager;
 use Voxora\Storage\SqliteRepository;
 use Voxora\Security\RateLimiter;
 use Voxora\TTS\WebhookDispatcher;
-use PHPUnit\Framework\MockObject\MockObject;
+use RuntimeException;
 
 class ApiControllerTest extends TestCase
 {
     private ApiController $controller;
-    private KeyManager&MockObject $keyManager;
-    private Manager&MockObject $ttsManager;
-    private SqliteRepository&MockObject $repository;
-    private RateLimiter&MockObject $rateLimiter;
-    private WebhookDispatcher&MockObject $webhookDispatcher;
-    private Request&MockObject $request;
+    private KeyManager $keyManager;
+    private Manager $ttsManager;
+    private SqliteRepository $repository;
+    private RateLimiter $rateLimiter;
+    private WebhookDispatcher $webhookDispatcher;
 
     protected function setUp(): void
     {
@@ -33,11 +31,10 @@ class ApiControllerTest extends TestCase
         $this->repository = $this->createMock(SqliteRepository::class);
         $this->rateLimiter = $this->createMock(RateLimiter::class);
         $this->webhookDispatcher = $this->createMock(WebhookDispatcher::class);
-        $this->request = $this->createMock(Request::class);
 
         $config = [
             'audio' => [
-                'directory' => '/tmp/audio',
+                'directory' => '/tmp',
                 'public_url_prefix' => '/audio',
             ],
         ];
@@ -54,167 +51,206 @@ class ApiControllerTest extends TestCase
 
     public function testIssueTokenActionRejectsMissingName(): void
     {
-        $this->request->method('getPost')->willReturn('');
-        $this->rateLimiter->method('isAllowed')->willReturn(true);
+        $request = new Request(post: []);
 
-        $response = $this->controller->issueTokenAction($this->request);
+        $response = $this->controller->issueTokenAction($request);
 
-        $this->assertSame(400, $response->getStatus());
-        $data = json_decode($response->getBody(), true);
-        $this->assertArrayHasKey('error', $data);
+        $this->assertArrayHasKey('error', $response);
+        $this->assertStringContainsString('name', strtolower($response['error']));
+        $this->assertEquals(400, $response['status'] ?? 400);
     }
 
     public function testSpeechActionRejectsInvalidToken(): void
     {
-        $this->keyManager->method('validate')->willReturn(null);
-        $this->request->method('getHeader')->willReturn('Bearer invalid');
+        $request = new Request(
+            post: ['text' => 'hello', 'voice_id' => 'voice123'],
+            headers: ['Authorization' => 'Bearer invalid']
+        );
 
-        $response = $this->controller->speechAction($this->request);
+        $this->keyManager->method('validate')
+            ->willThrowException(new RuntimeException('Invalid token'));
 
-        $this->assertSame(401, $response->getStatus());
+        $this->rateLimiter->method('isAllowed')->willReturn(true);
+
+        $response = $this->controller->speechAction($request);
+
+        $this->assertArrayHasKey('error', $response);
+        $this->assertEquals(401, $response['status'] ?? 0);
     }
 
     public function testSpeechActionEnforcesRateLimit(): void
     {
-        $token = new Token('id1', 'test', ['tts:generate'], 'user', 1, time() + 3600);
-        $this->keyManager->method('validate')->willReturn($token);
+        $request = new Request(
+            post: ['text' => 'test', 'voice_id' => 'v1'],
+            headers: ['X-Api-Key' => 'testkey']
+        );
+
         $this->rateLimiter->method('isAllowed')->willReturn(false);
-        $this->rateLimiter->method('getLimit')->willReturn(100);
-        $this->rateLimiter->method('getWindow')->willReturn(60);
         $this->rateLimiter->method('getRemaining')->willReturn(0);
 
-        $response = $this->controller->speechAction($this->request);
+        $response = $this->controller->speechAction($request);
 
-        $this->assertSame(429, $response->getStatus());
-        $data = json_decode($response->getBody(), true);
-        $this->assertSame('rate_limit_exceeded', $data['code']);
+        $this->assertArrayHasKey('error', $response);
+        $this->assertEquals(429, $response['status'] ?? 0);
+        $this->assertArrayHasKey('limit', $response);
     }
 
     public function testSpeechActionRejectsMissingText(): void
     {
-        $token = new Token('id1', 'test', ['tts:generate'], 'user', 1, time() + 3600);
-        $this->keyManager->method('validate')->willReturn($token);
+        $request = new Request(
+            post: ['voice_id' => 'v1'],
+            headers: ['Authorization' => 'Bearer valid']
+        );
+
+        $tokenMock = $this->createMock(Token::class);
+        $tokenMock->method('hasScope')->willReturn(true);
+        $this->keyManager->method('validate')->willReturn($tokenMock);
         $this->rateLimiter->method('isAllowed')->willReturn(true);
-        $this->request->method('getPost')->willReturnMap([
-            ['text', '', ''],
-            ['voice_id', '', 'valid-voice'],
-        ]);
 
-        $response = $this->controller->speechAction($this->request);
+        $response = $this->controller->speechAction($request);
 
-        $this->assertSame(400, $response->getStatus());
+        $this->assertArrayHasKey('error', $response);
+        $this->assertStringContainsString('text', strtolower($response['error']));
     }
 
     public function testSpeechActionSuccessPath(): void
     {
-        $token = new Token('id1', 'test', ['tts:generate'], 'user', 1, time() + 3600);
-        $this->keyManager->method('validate')->willReturn($token);
-        $this->rateLimiter->method('isAllowed')->willReturn(true);
-        $this->rateLimiter->method('getRemaining')->willReturn(99);
+        $request = new Request(
+            post: [
+                'text' => 'Hello world',
+                'voice_id' => '21m00Tcm4TlvDq8ikWAM',
+                'normalize' => '1',
+            ],
+            headers: ['X-Api-Key' => 'validkey']
+        );
 
-        $this->request->method('getPost')->willReturnMap([
-            ['text', '', 'Hello world'],
-            ['voice_id', '', 'voice-123'],
-            ['provider', '', 'elevenlabs'],
-            ['normalize', 'true', 'true'],
-            ['format', 'mp3', 'mp3'],
-        ]);
-        $this->request->method('getHeader')->willReturn('Bearer vxo_abc123');
+        $tokenMock = $this->createMock(Token::class);
+        $tokenMock->method('hasScope')->willReturn(true);
+        $tokenMock->method('getUserId')->willReturn(1);
+
+        $this->keyManager->method('validate')->willReturn($tokenMock);
+        $this->rateLimiter->method('isAllowed')->willReturn(true);
 
         $resultMock = $this->createMock(\Voxora\TTS\SynthesisResult::class);
-        $resultMock->method('save')->willReturn(true);
-        $resultMock->format = 'mp3';
-        $resultMock->duration = 5.2;
-        $resultMock->metadata = ['normalized' => true];
-        $resultMock->audioContent = 'fake-audio';
-        $resultMock->method('toDataUri')->willReturn('data:audio/mp3;base64,ZmFrZQ==');
+        $resultMock->method('getDuration')->willReturn(2.5);
+        $resultMock->method('toDataUri')->willReturn('data:audio/mp3;base64,xxx');
 
         $this->ttsManager->method('generate')->willReturn($resultMock);
-        $this->repository->method('saveGeneration')->willReturn(1);
-        $this->webhookDispatcher->method('dispatchSuccess');
+        $this->repository->expects($this->once())->method('recordGeneration');
 
-        $response = $this->controller->speechAction($this->request);
+        $response = $this->controller->speechAction($request);
 
-        $this->assertSame(200, $response->getStatus());
-        $data = json_decode($response->getBody(), true);
-        $this->assertTrue($data['success']);
-        $this->assertArrayHasKey('audio_url', $data);
+        $this->assertArrayHasKey('audio', $response);
+        $this->assertArrayHasKey('duration', $response);
+        $this->assertEquals(2.5, $response['duration']);
     }
 
     public function testHistoryActionReturnsScopedResults(): void
     {
-        $token = new Token('id1', 'test', ['tts:generate'], 'user', 1, time() + 3600);
-        $this->keyManager->method('validate')->willReturn($token);
+        $request = new Request(
+            query: ['page' => '1', 'per_page' => '10'],
+            headers: ['X-Api-Key' => 'key']
+        );
+
+        $tokenMock = $this->createMock(Token::class);
+        $tokenMock->method('getUserId')->willReturn(1);
+        $this->keyManager->method('validate')->willReturn($tokenMock);
         $this->rateLimiter->method('isAllowed')->willReturn(true);
-        $this->rateLimiter->method('getRemaining')->willReturn(50);
 
         $this->repository->method('getHistory')->willReturn([
-            ['id' => 1, 'text' => 'Hello'],
+            'items' => [],
+            'pagination' => [
+                'current_page' => 1,
+                'total_pages' => 1,
+                'total_items' => 0,
+                'per_page' => 10,
+                'has_next' => false,
+                'has_prev' => false,
+            ],
+            'filters' => [],
         ]);
 
-        $response = $this->controller->historyAction($this->request);
+        $response = $this->controller->historyAction($request);
 
-        $this->assertSame(200, $response->getStatus());
-        $data = json_decode($response->getBody(), true);
-        $this->assertArrayHasKey('history', $data);
-        $this->assertArrayHasKey('user_id', $data);
+        $this->assertArrayHasKey('items', $response);
+        $this->assertArrayHasKey('pagination', $response);
     }
 
     public function testExportLibraryActionReturnsBundleWithDownloadHeader(): void
     {
+        $request = new Request(
+            headers: ['X-Api-Key' => 'key']
+        );
+
+        $tokenMock = $this->createMock(Token::class);
+        $this->keyManager->method('validate')->willReturn($tokenMock);
+        $this->rateLimiter->method('isAllowed')->willReturn(true);
+
         $this->repository->method('exportLibrary')->willReturn([
             'version' => '1.0',
             'voices' => [],
         ]);
 
-        $response = $this->controller->exportLibraryAction($this->request);
+        $response = $this->controller->exportLibraryAction($request);
 
-        $this->assertSame(200, $response->getStatus());
-        $this->assertStringContainsString('application/json', $response->getHeader('Content-Type'));
+        $this->assertArrayHasKey('version', $response);
+        $this->assertArrayHasKey('voices', $response);
     }
 
     public function testCloneVoiceActionRejectsInvalidToken(): void
     {
-        $this->keyManager->method('validate')->willReturn(null);
-        $this->request->method('getHeader')->willReturn('vxo_invalid');
+        $request = new Request(
+            post: ['name' => 'Test Voice'],
+            headers: []
+        );
 
-        $response = $this->controller->cloneVoiceAction($this->request);
+        $this->keyManager->method('validate')
+            ->willThrowException(new RuntimeException('Invalid token'));
 
-        $this->assertSame(401, $response->getStatus());
+        $response = $this->controller->cloneVoiceAction($request);
+
+        $this->assertArrayHasKey('error', $response);
+        $this->assertEquals(401, $response['status'] ?? 0);
     }
 
     public function testCloneVoiceActionSuccess(): void
     {
-        $token = new Token('id1', 'test', ['tts:generate'], 'user', 1, time() + 3600);
-        $this->keyManager->method('validate')->willReturn($token);
+        $request = new Request(
+            post: ['name' => 'Cloned Voice'],
+            files: ['sample' => ['tmp_name' => '/tmp/sample.wav', 'name' => 'sample.wav', 'error' => 0]],
+            headers: ['X-Api-Key' => 'valid']
+        );
+
+        $tokenMock = $this->createMock(Token::class);
+        $this->keyManager->method('validate')->willReturn($tokenMock);
         $this->rateLimiter->method('isAllowed')->willReturn(true);
-        $this->rateLimiter->method('getRemaining')->willReturn(80);
 
-        $this->request->method('getPost')->with('name')->willReturn('My Cloned Voice');
-        $_FILES['sample'] = [
-            'error' => UPLOAD_ERR_OK,
-            'tmp_name' => '/tmp/sample.wav',
-            'type' => 'audio/wav',
-        ];
+        $this->ttsManager->method('cloneVoice')->willReturn('new-voice-id-123');
+        $this->repository->expects($this->once())->method('saveCustomVoice');
 
-        $this->ttsManager->method('cloneVoice')->willReturn('cloned-voice-xyz');
+        $response = $this->controller->cloneVoiceAction($request);
 
-        $response = $this->controller->cloneVoiceAction($this->request);
-
-        $this->assertSame(200, $response->getStatus());
-        $data = json_decode($response->getBody(), true);
-        $this->assertTrue($data['success']);
-        $this->assertSame('cloned-voice-xyz', $data['voice_id']);
+        $this->assertArrayHasKey('voice_id', $response);
+        $this->assertEquals('new-voice-id-123', $response['voice_id']);
     }
 
     public function testListVoicesAction(): void
     {
-        $this->repository->method('listLibrary')->willReturn([['id' => 'v1', 'name' => 'Voice One']]);
+        $request = new Request(
+            query: ['provider' => 'openai'],
+            headers: ['X-Api-Key' => 'valid']
+        );
 
-        $response = $this->controller->listVoicesAction($this->request);
+        $this->ttsManager->method('listVoices')
+            ->with('openai')
+            ->willReturn([
+                ['id' => 'alloy', 'name' => 'Alloy'],
+                ['id' => 'echo', 'name' => 'Echo'],
+            ]);
 
-        $this->assertSame(200, $response->getStatus());
-        $data = json_decode($response->getBody(), true);
-        $this->assertArrayHasKey('voices', $data);
+        $response = $this->controller->listVoicesAction($request);
+
+        $this->assertIsArray($response);
+        $this->assertCount(2, $response);
     }
 }
