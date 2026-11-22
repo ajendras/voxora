@@ -334,35 +334,180 @@ $voiceId = $manager->cloneVoice(
 
 The sample is posted as multipart to the provider, the voice is persisted in the `voices` SQLite table (with `is_cloned=1`), and can be used in any `generate()` call.
 
-### Plugin system for new TTS providers
+### Implementing and registering custom TTS providers
 
-After booting the kernel you can register arbitrary `ProviderInterface` implementations at runtime. They become instantly available everywhere (dashboard dropdown, API, batch processing, analytics).
+This dedicated guide explains how to extend Voxora with your own TTS providers (e.g. Azure Cognitive Services, Google Cloud TTS, Amazon Polly, or another local engine). The plugin system is designed to be easily pluggable while maintaining the same security, caching, batch, scheduling, analytics, UI integration and post-processing as the built-in providers.
+
+#### The ProviderInterface
+
+All providers must implement `Voxora\TTS\ProviderInterface`. See the full, up-to-date contract and phpDoc in `src/TTS/ProviderInterface.php`.
+
+Key methods to implement:
+
+1. **`synthesize(string $text, string $voiceId, array $options = []): SynthesisResult`**
+   - `$text` may contain SSML. Pass it through if supported, otherwise strip tags (see `OpenAIProvider` for a clean regex example).
+   - Respect `$options['format']` ('mp3' or 'wav') and other keys such as `model`, `speed`, `target_loudness`.
+   - Return a `SynthesisResult` instance with the raw audio bytes, format and duration (in seconds). The `Manager` automatically applies FFmpeg post-processing when requested.
+   - Throw `RuntimeException` on any failure — the `Manager` will transparently fallback to Piper when configured.
+
+2. **`listVoices(): array`**
+   - Must return an array of voice definitions. Each voice is an associative array with at least `'id'` and `'name'`. Recommended additional keys: `'language'`, `'gender'`, `'description'`.
+   - Example: `[['id' => 'en-US-Standard-A', 'name' => 'Standard A', 'language' => 'en-US']]`
+   - Used by the dashboard dropdown, `Manager::listVoices()`, the `/api/v1/voices` endpoint and analytics.
+
+3. **`cloneVoice(string $name, string $samplePath, array $options = []): string`**
+   - Upload the sample file and create a new voice on the provider side.
+   - Return the provider-assigned voice ID (string) so it can be persisted by `Manager` and `SqliteRepository`.
+   - If cloning is not supported, throw `RuntimeException('Voice cloning not supported by this provider.')`. `PiperProvider` follows this pattern.
+
+#### Full working example (Google Cloud TTS style provider)
+
+```php
+<?php
+
+declare(strict_types=1);
+
+namespace MyCompany\TTS;
+
+use Voxora\TTS\ProviderInterface;
+use Voxora\TTS\SynthesisResult;
+use GuzzleHttp\Client;
+use GuzzleHttp\Exception\GuzzleException;
+use RuntimeException;
+
+class GoogleTTSProvider implements ProviderInterface
+{
+    private Client $client;
+    private array $config;
+
+    public function __construct(array $config = [])
+    {
+        $this->config = $config;
+        $this->client = new Client([
+            'base_uri' => $config['base_uri'] ?? 'https://texttospeech.googleapis.com/v1/',
+            'query' => ['key' => $config['api_key'] ?? ''],
+        ]);
+    }
+
+    public function synthesize(string $text, string $voiceId, array $options = []): SynthesisResult
+    {
+        $format = strtolower($options['format'] ?? 'mp3');
+        $inputType = str_contains($text, '<speak>') ? 'ssml' : 'text';
+
+        try {
+            $response = $this->client->post('text:synthesize', [
+                'json' => [
+                    'input' => [$inputType => $text],
+                    'voice' => [
+                        'languageCode' => 'en-US',
+                        'name' => $voiceId,
+                    ],
+                    'audioConfig' => [
+                        'audioEncoding' => $format === 'mp3' ? 'MP3' : 'LINEAR16',
+                    ],
+                ],
+            ]);
+
+            $data = json_decode((string) $response->getBody(), true, 512, JSON_THROW_ON_ERROR);
+            $audioContent = base64_decode($data['audioContent']);
+
+            // Rough duration estimate (16kHz mono)
+            $duration = strlen($audioContent) / 32000;
+
+            return new SynthesisResult($audioContent, $format, $duration);
+        } catch (GuzzleException $e) {
+            throw new RuntimeException('Google TTS synthesis failed: ' . $e->getMessage(), 0, $e);
+        }
+    }
+
+    public function listVoices(): array
+    {
+        return [
+            ['id' => 'en-US-Standard-A', 'name' => 'Standard A (Female)', 'language' => 'en-US'],
+            ['id' => 'en-US-Standard-B', 'name' => 'Standard B (Male)', 'language' => 'en-US'],
+            ['id' => 'en-US-Wavenet-C', 'name' => 'Wavenet C (Female)', 'language' => 'en-US'],
+            ['id' => 'en-US-Wavenet-D', 'name' => 'Wavenet D (Male)', 'language' => 'en-US'],
+        ];
+    }
+
+    public function cloneVoice(string $name, string $samplePath, array $options = []): string
+    {
+        throw new RuntimeException('Voice cloning not supported by GoogleTTSProvider. Use ElevenLabs instead.');
+    }
+}
+```
+
+#### Registering the provider
+
+**Runtime registration (ideal for plugins)**
 
 ```php
 use Voxora\Kernel;
-use MyApp\OpenAITTSProvider; // your implementation
+use MyCompany\TTS\GoogleTTSProvider;
 
 $config = require __DIR__ . '/config/app.php';
-$kernel = new Kernel($config);
-$kernel->boot();
-
+$kernel = (new Kernel($config))->boot();
 $manager = $kernel->getTtsManager();
 
-// Register at runtime (plugin system)
-$openai = new OpenAITTSProvider(['api_key' => 'sk-...']);
-$manager->registerProvider('openai', $openai);
+$provider = new GoogleTTSProvider([
+    'api_key' => 'your-google-cloud-api-key',
+    'base_uri' => 'https://texttospeech.googleapis.com/v1/',
+]);
 
-// Use it immediately (the built-in OpenAIProvider is already registered if configured)
+$manager->registerProvider('google', $provider);
+
+// Immediately usable everywhere
 $result = $manager->generate(
-    text: "Hello from OpenAI TTS",
-    voiceId: "alloy",
-    provider: "openai"
+    text: "Hello from the custom Google provider.",
+    voiceId: "en-US-Standard-A",
+    provider: "google",
+    options: ['format' => 'mp3']
 );
-
-$result->save('output/openai.mp3');
+$result->save('output/google.mp3');
 ```
 
-You can also define custom providers in `config/app.php` under the `providers` key with a `class` entry; Kernel will instantiate and register them automatically. The built-in `OpenAIProvider` is automatically registered when an `api_key` is present under `providers.openai`.
+**Configuration-driven auto-registration (recommended for production)**
+
+Add to `config/app.php`:
+
+```php
+'providers' => [
+    'eleven' => [ /* ... */ ],
+    'openai' => [ /* ... */ ],
+    'piper' => [ /* ... */ ],
+    'google' => [
+        'class' => \MyCompany\TTS\GoogleTTSProvider::class,
+        'api_key' => 'AIzaSy...',
+        'base_uri' => 'https://texttospeech.googleapis.com/v1/',
+    ],
+],
+```
+
+`Kernel::boot()` scans the `providers` array, instantiates any entry that contains a `class` key (passing the sub-array to the constructor) and registers it under the key name via `Manager::registerProvider()`.
+
+#### Integration and availability
+
+After registration your provider is a first-class citizen:
+
+- Selectable in the dashboard provider dropdown (populated from `Manager::listProviders()`).
+- Usable via the REST API (`?provider=google` or JSON field).
+- Supported in CSV batch jobs (`provider` column) and `Scheduler`.
+- Returned by `Manager::listVoices('google')` and the voices endpoint.
+- Included in usage analytics breakdown.
+- All Manager features (caching by content hash, FFmpeg normalization, webhook dispatch, rate limiting, fallback to Piper) apply automatically.
+
+#### Best practices
+
+- Constructor must accept an `array $config` for keys, endpoints, defaults.
+- Never log credentials. All keys stay server-side.
+- For local/CLI providers see `PiperProvider.php` (uses `Symfony\Component\Process\Process`).
+- For SSML stripping see the implementation inside `OpenAIProvider`.
+- Duration extraction for WAV can reuse the RIFF-header logic from `PiperProviderTest.php`.
+- Test following the style of the existing unit tests. Mock HTTP calls with Guzzle middleware when possible.
+- The `Manager` already caches results in SQLite; your provider is only invoked on cache misses.
+- Keep voice IDs stable and human-readable.
+
+See the built-in providers (`ElevenLabsProvider.php`, `OpenAIProvider.php`, `PiperProvider.php`) for production patterns. The interface, registration flow and automatic UI exposure are intentionally minimal so that adding a new backend takes <50 lines of code.
 
 ### Issue a scoped API token
 
@@ -653,7 +798,7 @@ flowchart TD
     Dashboard --> History
 ```
 
-`Kernel` wires together `KeyManager`, `TTS\Manager`, `SqliteRepository` and the two controllers. All synthesis paths converge on `Manager::generate()`, which selects a `ProviderInterface` implementation, caches results and records usage. The dashboard uses HTMX fragments while the API returns JSON with public audio URLs. Sessions + `users` table enable multi-user isolation and role checks (`admin` vs `user`). Piper is used as automatic fallback for offline/resilient operation. Voice cloning is handled by `Manager::cloneVoice()` which delegates to the provider, stores the voice, and makes it available in `listLibrary()`. The new SSML editor lives inside `DashboardController::renderSynthPanel()` with pure-JS tag insertion that feeds directly into the existing HTMX generation flow. **FFmpeg integration lives in `SynthesisResult::process()`** and is invoked automatically by `Manager`. The analytics dashboard is rendered server-side with Chart.js consuming JSON data produced by `SqliteRepository::getUsageStats()` (including automatic date-gap filling). **RateLimiter** sits in front of protected actions and uses Redis counters (per-user or per-IP) to enforce throttling. The plugin system lives in `Manager::registerProvider()` and is populated at boot by `Kernel`; any `ProviderInterface` can be added at runtime and is automatically surfaced in the UI, API and batch runner. The new `Scheduler` (with embedded `CronExpression` parser) reads from the `scheduled_jobs` table, evaluates due jobs, calls `BatchGenerator`, updates last-run timestamps and logs activity. It is intended to be executed by native system cron. The UI layer now includes a persistent theme engine (localStorage + Tailwind `dark` class on `<html>`) and accessibility enhancements throughout all rendered markup and fragments. The voice library export lives in `SqliteRepository::exportLibrary()` (returns a versioned array) and is exposed via a new `ApiController::exportLibraryAction()` endpoint. The new import support lives in `SqliteRepository::importLibrary()`, `ApiController::importLibraryAction()` and `DashboardController::libraryAction()` (POST handling + HTMX fragment). The new `OpenAIProvider` implements voice listing (static list of the six standard voices) and gracefully strips SSML tags before calling the OpenAI `/audio/speech` endpoint. The new jobs UI is fully integrated into `DashboardController::jobsAction()` with forms, HTMX actions and status badges powered by the expanded repository and scheduler methods. **History now supports server-side pagination and multiple filters** via `SqliteRepository::getHistory(array $params)` (used by both API and dashboard HTMX view).
+`Kernel` wires together `KeyManager`, `TTS\Manager`, `SqliteRepository` and the two controllers. All synthesis paths converge on `Manager::generate()`, which selects a `ProviderInterface` implementation, caches results and records usage. The dashboard uses HTMX fragments while the API returns JSON with public audio URLs. Sessions + `users` table enable multi-user isolation and role checks (`admin` vs `user`). Piper is used as automatic fallback for offline/resilient operation. Voice cloning is handled by `Manager::cloneVoice()` which delegates to the provider, stores the voice, and makes it available in `listLibrary()`. The new SSML editor lives inside `DashboardController::renderSynthPanel()` with pure-JS tag insertion that feeds directly into the existing HTMX generation flow. **FFmpeg integration lives in `SynthesisResult::process()`** and is invoked automatically by `Manager`. The analytics dashboard is rendered server-side with Chart.js consuming JSON data produced by `SqliteRepository::getUsageStats()` (including automatic date-gap filling). **RateLimiter** sits in front of protected actions and uses Redis counters (per-user or per-IP) to enforce throttling. The plugin system lives in `Manager::registerProvider()` and is populated at boot by `Kernel`; any `ProviderInterface` can be added at runtime and is automatically surfaced in the UI, API and batch runner. The new `Scheduler` (with embedded `CronExpression` parser) reads from the `scheduled_jobs` table, evaluates due jobs, calls `BatchGenerator`, updates last-run timestamps and logs activity. It is intended to be executed by native system cron. The UI layer now includes a persistent theme engine (localStorage + Tailwind `dark` class on `<html>`) and accessibility enhancements throughout all rendered markup and fragments. The voice library export lives in `SqliteRepository::exportLibrary()` (returns a versioned array) and is exposed via a new `ApiController::exportLibraryAction()` endpoint. The new import support lives in `SqliteRepository::importLibrary()`, `ApiController::importLibraryAction()` and `DashboardController::libraryAction()` (POST handling + HTMX fragment). The new `OpenAIProvider` implements voice listing (static list of the six standard voices) and gracefully strips SSML tags before calling the OpenAI `/audio/speech` endpoint. The new jobs UI is fully integrated into `DashboardController::jobsAction()` with forms, HTMX actions and status badges powered by the expanded repository and scheduler methods. **History now supports server-side pagination and multiple filters** via `SqliteRepository::getHistory(array $params)` (used by both API and dashboard HTMX view). The dedicated custom-provider guide (this document) and the expanded `ProviderInterface` phpDoc make implementing new backends straightforward and fully integrated.
 
 ## 📁 Project structure
 
@@ -668,7 +813,7 @@ flowchart TD
 │   ├── Security/
 │   │   └── KeyManager.php        # issueToken(), validate(), Token (now with role/userId), User concepts
 │   ├── TTS/
-│   │   ├── ProviderInterface.php # synthesize() + listVoices() + cloneVoice()
+│   │   ├── ProviderInterface.php # synthesize(), listVoices(), cloneVoice() — detailed contract + phpDoc for custom implementations
 │   │   ├── ElevenLabsProvider.php # implements cloning via /v1/voices/add + dynamic voice listing
 │   │   ├── OpenAIProvider.php    # new: OpenAI TTS with voice listing + SSML stripping
 │   │   ├── PiperProvider.php     # local synthesis via Symfony Process + WAV output (throws on clone)
@@ -732,7 +877,7 @@ The test suite covers `KeyManager` token issuance, validation, expiry checks, en
 - [x] Implement token revocation list in KeyManager with SQLite persistence
 - [x] Add pagination and filters to generation history view and API endpoint
 - [x] Provide official Docker Compose file with Redis, Piper and example voices
-- [ ] Write dedicated guide for implementing and registering custom TTS providers
+- [x] Write dedicated guide for implementing and registering custom TTS providers
 
 > 🤖 This roadmap is worked through continuously — ideas and PRs welcome!
 <!-- roadmap:end -->
