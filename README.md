@@ -126,11 +126,11 @@ Dark and light mode with localStorage persistence, Tailwind dark variants, full 
 
 **Requirements**
 
-- PHP 8.2+ with `ext-sqlite3`, `ext-sodium`, `ext-json`, `ext-mbstring`
+- Docker + Docker Compose (recommended — includes everything)
+- OR PHP 8.2+ with `ext-sqlite3`, `ext-sodium`, `ext-json`, `ext-mbstring`
 - Composer
-- (Optional) Piper binary + voice model for local fallback
-- (Optional) FFmpeg CLI for normalization & format conversion
-- (Optional but recommended) Redis for rate limiting
+- (Optional) FFmpeg for audio processing (included in Docker image)
+- (Optional but recommended) Redis for rate limiting (included in Docker)
 
 ```bash
 composer create-project ajendras/voxora voxora-app
@@ -144,6 +144,58 @@ composer run serve
 ```
 
 The app will be available at http://localhost:8080/login (default admin/demo123).
+
+## 🐳 Docker Setup
+
+Voxora now ships an official `docker-compose.yml` and `Dockerfile` that provide a complete, ready-to-run environment with Redis, Piper (with example voices) and all dependencies.
+
+**Included:**
+
+- PHP 8.2 + Apache
+- Redis 7
+- Piper v1.2.0 binary
+- Example voice: `en_US-lessac-medium` (high quality US English)
+- FFmpeg for normalization
+- Persistent volumes for `data/` (SQLite), `storage/`
+
+### Usage
+
+```bash
+# 1. Clone repository
+git clone https://github.com/ajendras/voxora.git voxora-app
+cd voxora-app
+
+# 2. Copy configuration
+cp config/app.example.php config/app.php
+
+# 3. Edit `config/app.php`:
+#    - Generate a strong `security.encrypt_key` (openssl rand -hex 32)
+#    - Add your `providers.eleven.api_key` and/or OpenAI key
+#    - Configure Piper for the Docker paths:
+#      'piper' => [
+#          'binary' => '/usr/local/bin/piper',
+#          'model' => '/usr/share/piper/en_US-lessac-medium.onnx',
+#      ],
+#    - Configure Redis:
+#      'redis' => [
+#          'host' => 'redis',
+#          'port' => 6379,
+#      ],
+
+# 4. Start services
+docker compose up --build -d
+
+# 5. Visit http://localhost:8080/login
+#    Default credentials: admin / demo123
+```
+
+You can add more voices by downloading additional ONNX models in the Dockerfile and updating the voice library.
+
+Logs are available with `docker compose logs -f`.
+
+To stop: `docker compose down`
+
+This setup makes Voxora production-ready with zero manual binary installation.
 
 ## 🗣️ Local TTS with Piper
 
@@ -173,6 +225,8 @@ Voxora automatically falls back to fully offline TTS using the Piper engine (via
 ```
 
 The `TTS\Manager::generate()` call will transparently fallback. WAV output is returned for local generations. Explicit usage: `provider: 'piper'`.
+
+When using Docker the binary and model are already present at the paths shown in the Docker section above. The `docker-compose.yml` also wires Redis automatically.
 
 **FFmpeg post-processing** (new): All results can be normalized and/or converted via `$result->process(['normalize' => true, 'target_loudness' => -16, 'format' => 'mp3'])`. FFmpeg must be installed and available in `$PATH` (or configure absolute path). Loudness uses the industry-standard `loudnorm` filter.
 
@@ -636,6 +690,8 @@ flowchart TD
 │       ├── KeyManagerTest.php    # token issuance, validation, expiry, scopes, roles
 │       ├── PiperProviderTest.php # WAV RIFF duration, cloneVoice exception, listVoices
 │       └── SchedulerTest.php     # CronExpression + Scheduler (mocks)
+├── Dockerfile                    # Official container with Piper + example voice
+├── docker-compose.yml            # Redis + PHP/Apache stack
 └── data/                         # SQLite DB and generated audio (gitignored)
 ```
 
@@ -675,7 +731,7 @@ The test suite covers `KeyManager` token issuance, validation, expiry checks, en
 - [x] Expand test coverage with integration tests for ApiController endpoints
 - [x] Implement token revocation list in KeyManager with SQLite persistence
 - [x] Add pagination and filters to generation history view and API endpoint
-- [ ] Provide official Docker Compose file with Redis, Piper and example voices
+- [x] Provide official Docker Compose file with Redis, Piper and example voices
 - [ ] Write dedicated guide for implementing and registering custom TTS providers
 
 > 🤖 This roadmap is worked through continuously — ideas and PRs welcome!
