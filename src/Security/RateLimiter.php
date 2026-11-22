@@ -4,83 +4,84 @@ declare(strict_types=1);
 
 namespace Voxora\Security;
 
-use Predis\Client as PredisClient;
-use Predis\ClientInterface;
-use RuntimeException;
+use Predis\Client as RedisClient;
+use Predis\Connection\ConnectionException;
+use Exception;
 
 /**
  * RateLimiter
  *
- * Redis-backed fixed-window rate limiter for request throttling.
- * Uses per-window increment counters (e.g. rate:user:123:174000). 
- * Identifier can be a user ID, token hash or IP address.
- * Fails open (returns true) on Redis errors to avoid blocking production.
+ * Redis-backed fixed window rate limiter with per-identifier tracking.
+ * Fails open on Redis errors to maintain availability.
+ * Used by ApiController to enforce limits on API and dashboard actions.
  */
-final class RateLimiter
+class RateLimiter
 {
-    private ClientInterface $client;
-    private int $maxRequests;
-    private int $windowSeconds;
+    private RedisClient $redis;
+    private int $limit;
+    private int $window;
 
-    /**
-     * @param ClientInterface $client Predis client connected to Redis
-     * @param int $maxRequests Maximum requests allowed inside the window
-     * @param int $windowSeconds Duration of the sliding window in seconds
-     */
-    public function __construct(
-        ClientInterface $client,
-        int $maxRequests = 100,
-        int $windowSeconds = 60
-    ) {
-        $this->client = $client;
-        $this->maxRequests = $maxRequests;
-        $this->windowSeconds = $windowSeconds;
+    public function __construct(RedisClient $redis, array $config)
+    {
+        $this->redis = $redis;
+        $this->limit = (int) ($config['rate_limit']['requests'] ?? 100);
+        $this->window = (int) ($config['rate_limit']['window'] ?? 60);
     }
 
-    /**
-     * Determine whether a request is allowed for the given identifier.
-     */
     public function isAllowed(string $identifier): bool
     {
-        $window = (int) (time() / $this->windowSeconds);
-        $key = "ratelimit:{$identifier}:{$window}";
+        $key = "rate:{$identifier}";
 
         try {
-            $count = (int) $this->client->incr($key);
+            $count = (int) $this->redis->incrby($key, 1);
 
             if ($count === 1) {
-                $this->client->expire($key, $this->windowSeconds);
+                $this->redis->expire($key, $this->window);
             }
 
-            return $count <= $this->maxRequests;
-        } catch (\Throwable) {
-            return true; // fail open
+            if ($count > $this->limit) {
+                throw new RateLimitExceededException(
+                    'Rate limit exceeded. Try again later.',
+                    $this->limit,
+                    0,
+                    $this->window
+                );
+            }
+
+            return true;
+        } catch (ConnectionException | Exception $e) {
+            if ($e instanceof RateLimitExceededException) {
+                throw $e;
+            }
+            // fail open on Redis outage
+            return true;
         }
     }
 
-    /**
-     * Return how many requests remain in the current window.
-     */
     public function getRemaining(string $identifier): int
     {
-        $window = (int) (time() / $this->windowSeconds);
-        $key = "ratelimit:{$identifier}:{$window}";
+        $key = "rate:{$identifier}";
 
         try {
-            $used = (int) $this->client->get($key);
-            return max(0, $this->maxRequests - $used);
-        } catch (\Throwable) {
-            return $this->maxRequests;
+            $count = (int) $this->redis->get($key);
+            return max(0, $this->limit - $count);
+        } catch (ConnectionException | Exception $e) {
+            return $this->limit;
         }
     }
+}
 
-    public function getLimit(): int
-    {
-        return $this->maxRequests;
-    }
-
-    public function getWindow(): int
-    {
-        return $this->windowSeconds;
+/**
+ * Exception thrown when rate limit is exceeded.
+ */
+class RateLimitExceededException extends Exception
+{
+    public function __construct(
+        string $message,
+        public readonly int $limit,
+        public readonly int $remaining,
+        public readonly int $windowSeconds
+    ) {
+        parent::__construct($message, 429);
     }
 }
