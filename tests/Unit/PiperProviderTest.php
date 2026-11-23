@@ -8,47 +8,42 @@ use PHPUnit\Framework\TestCase;
 use Voxora\TTS\PiperProvider;
 use Voxora\TTS\SynthesisResult;
 use Symfony\Component\Process\Process;
-use Voxora\TTS\WebhookDispatcher;
 use PHPUnit\Framework\MockObject\MockObject;
 
 class PiperProviderTest extends TestCase
 {
     private PiperProvider $provider;
-    private WebhookDispatcher|MockObject $webhookDispatcher;
+    private MockObject $processMock;
 
     protected function setUp(): void
     {
-        $this->webhookDispatcher = $this->createMock(WebhookDispatcher::class);
+        $this->processMock = $this->createMock(Process::class);
+
+        $processFactory = fn(): Process => $this->processMock;
+
         $config = [
             'binary' => 'piper',
-            'model' => __DIR__ . '/fixtures/test.onnx',
+            'model' => __DIR__ . '/../../models/en_US-lessac-medium.onnx',
         ];
-        $this->provider = new PiperProvider($config, $this->webhookDispatcher);
+
+        $this->provider = new PiperProvider($config, $processFactory);
     }
 
     public function testSynthesizeReturnsSynthesisResultWithCorrectDuration(): void
     {
-        $mockProcess = $this->createMock(Process::class);
-        $mockProcess->expects($this->once())
-            ->method('mustRun')
-            ->willReturnSelf();
+        $this->processMock->expects($this->once())
+            ->method('run')
+            ->willReturn(0);
 
-        $mockProcess->expects($this->once())
+        $this->processMock->expects($this->once())
             ->method('getOutput')
-            ->willReturn($this->createValidWavAudio(3.25));
+            ->willReturn($this->createTestWav(3.75));
 
-        // Inject mock process via reflection (matches existing test style for CI stability)
-        $reflection = new \ReflectionClass($this->provider);
-        $processProp = $reflection->getProperty('process');
-        $processProp->setAccessible(true);
-        $processProp->setValue($this->provider, $mockProcess);
-
-        $result = $this->provider->synthesize('Hello from Piper', 'en_US-lessac-medium');
+        $result = $this->provider->synthesize('Hello world from Piper.', 'en_US-lessac-medium');
 
         $this->assertInstanceOf(SynthesisResult::class, $result);
-        $this->assertSame('wav', $result->format);
-        $this->assertGreaterThan(0.0, $result->duration);
-        $this->assertEqualsWithDelta(3.25, $result->duration, 0.1);
+        $this->assertEquals(3.75, $result->duration);
+        $this->assertEquals('wav', $result->format);
     }
 
     public function testCloneVoiceThrowsException(): void
@@ -56,7 +51,7 @@ class PiperProviderTest extends TestCase
         $this->expectException(\RuntimeException::class);
         $this->expectExceptionMessage('Voice cloning not supported by this provider');
 
-        $this->provider->cloneVoice('Test Voice', '/tmp/sample.wav');
+        $this->provider->cloneVoice('My Voice', '/tmp/sample.wav');
     }
 
     public function testListVoicesReturnsArray(): void
@@ -69,30 +64,28 @@ class PiperProviderTest extends TestCase
         $this->assertArrayHasKey('name', $voices[0]);
     }
 
-    private function createValidWavAudio(float $durationSeconds): string
+    private function createTestWav(float $duration): string
     {
         $sampleRate = 22050;
         $numChannels = 1;
         $bitsPerSample = 16;
-        $byteRate = $sampleRate * $numChannels * (int) ($bitsPerSample / 8);
-        $dataSize = (int) ($byteRate * $durationSeconds);
+        $byteRate = (int) ($sampleRate * $numChannels * $bitsPerSample / 8);
+        $dataSize = (int) ($duration * $byteRate);
         $fileSize = 36 + $dataSize;
 
-        $wav = 'RIFF';
-        $wav .= pack('V', $fileSize);
-        $wav .= 'WAVE';
-        $wav .= 'fmt ';
-        $wav .= pack('V', 16);
-        $wav .= pack('v', 1);
-        $wav .= pack('v', $numChannels);
-        $wav .= pack('V', $sampleRate);
-        $wav .= pack('V', $byteRate);
-        $wav .= pack('v', $numChannels * ($bitsPerSample / 8));
-        $wav .= pack('v', $bitsPerSample);
-        $wav .= 'data';
-        $wav .= pack('V', $dataSize);
-        $wav .= str_repeat("\x00", $dataSize);
+        $header = 'RIFF' .
+            pack('V', $fileSize) .
+            'WAVEfmt ' .
+            pack('V', 16) .
+            pack('v', 1) .
+            pack('v', $numChannels) .
+            pack('V', $sampleRate) .
+            pack('V', $byteRate) .
+            pack('v', $numChannels * $bitsPerSample / 8) .
+            pack('v', $bitsPerSample) .
+            'data' .
+            pack('V', $dataSize);
 
-        return $wav;
+        return $header . str_repeat("\0", min(256, $dataSize));
     }
 }
