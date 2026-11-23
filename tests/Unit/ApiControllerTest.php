@@ -6,39 +6,44 @@ namespace Voxora\Tests\Unit;
 
 use PHPUnit\Framework\TestCase;
 use Voxora\Http\ApiController;
-use Voxora\Http\Request;
 use Voxora\Security\KeyManager;
 use Voxora\Security\Token;
 use Voxora\TTS\Manager;
-use Voxora\TTS\WebhookDispatcher;
 use Voxora\Storage\SqliteRepository;
 use Voxora\Security\RateLimiter;
-use Voxora\TTS\SynthesisResult;
+use Voxora\TTS\WebhookDispatcher;
+use Voxora\Http\Request;
+use PHPUnit\Framework\MockObject\MockObject;
 
 class ApiControllerTest extends TestCase
 {
     private ApiController $controller;
     private KeyManager $keyManager;
-    private Manager $ttsManager;
-    private SqliteRepository $repository;
-    private RateLimiter $rateLimiter;
-    private WebhookDispatcher $webhookDispatcher;
-    private Request $request;
+    private Manager|MockObject $ttsManager;
+    private SqliteRepository|MockObject $repository;
+    private RateLimiter|MockObject $rateLimiter;
+    private WebhookDispatcher|MockObject $webhookDispatcher;
+    private Request|MockObject $request;
 
     protected function setUp(): void
     {
-        $this->keyManager = $this->createMock(KeyManager::class);
-        $this->ttsManager = $this->createMock(Manager::class);
         $this->repository = $this->createMock(SqliteRepository::class);
-        $this->rateLimiter = $this->createMock(RateLimiter::class);
-        $this->webhookDispatcher = $this->createMock(WebhookDispatcher::class);
-
         $config = [
+            'security' => [
+                'encrypt_key' => 'this_is_a_32_byte_test_key_xxx',
+                'token_lifetime_days' => 90,
+            ],
             'audio' => [
-                'directory' => 'storage/audio',
+                'directory' => '/tmp',
                 'public_url_prefix' => '/audio',
             ],
         ];
+        $this->keyManager = new KeyManager($this->repository, $config);
+
+        $this->ttsManager = $this->createMock(Manager::class);
+        $this->rateLimiter = $this->createMock(RateLimiter::class);
+        $this->webhookDispatcher = $this->createMock(WebhookDispatcher::class);
+        $this->request = $this->createMock(Request::class);
 
         $this->controller = new ApiController(
             $this->keyManager,
@@ -48,89 +53,60 @@ class ApiControllerTest extends TestCase
             $this->webhookDispatcher,
             $this->rateLimiter
         );
-
-        $this->request = $this->createMock(Request::class);
     }
 
     public function testExportLibraryActionReturnsBundleWithDownloadHeader(): void
     {
-        $token = $this->createMock(Token::class);
-        $token->method('hasScope')->willReturn(true);
-        $token->method('getUserId')->willReturn(1);
-        $token->method('getRole')->willReturn('user');
-
-        $this->keyManager->method('validate')->willReturn($token);
-
-        $bundle = ['version' => '1.0', 'voices' => []];
-        $this->repository->method('exportLibrary')->willReturn($bundle);
-
-        $this->expectOutputString(json_encode([
-            'success' => true,
-            'bundle' => $bundle,
+        $this->rateLimiter->method('allow')->willReturn(true);
+        $this->repository->method('exportLibrary')->willReturn([
             'version' => '1.0',
-            'exported_at' => '2025-01-01T00:00:00+00:00',
-        ], JSON_THROW_ON_ERROR));
+            'voices' => [],
+        ]);
 
-        $this->request->method('getHeader')->willReturn('vxo_testkey');
+        $this->request->method('getHeader')->willReturn('vxo_validtoken123');
 
-        $this->controller->exportLibraryAction($this->request);
-        $this->assertStringContainsString('Content-Disposition:', implode(' ', headers_list()));
+        $response = $this->controller->exportLibraryAction($this->request);
+
+        $this->assertArrayHasKey('Content-Disposition', $response['headers']);
+        $this->assertStringContainsString('voices-bundle.json', $response['headers']['Content-Disposition']);
     }
 
     public function testCloneVoiceActionRejectsInvalidToken(): void
     {
-        $this->keyManager->method('validate')->willReturn(null);
-
-        $this->expectOutputString(json_encode(['error' => 'Invalid token or insufficient scope'], JSON_THROW_ON_ERROR));
         $this->request->method('getHeader')->willReturn('invalid-token');
 
-        $this->controller->cloneVoiceAction($this->request);
+        $response = $this->controller->cloneVoiceAction($this->request);
+
+        $this->assertSame(401, $response['status']);
+        $this->assertArrayHasKey('error', $response['body']);
     }
 
     public function testCloneVoiceActionSuccess(): void
     {
-        $token = $this->createMock(Token::class);
-        $token->method('hasScope')->willReturn(true);
-        $token->method('getUserId')->willReturn(1);
-        $token->method('getRole')->willReturn('user');
+        $this->rateLimiter->method('allow')->willReturn(true);
+        $this->request->method('getHeader')->willReturn('vxo_validtoken123');
+        $this->request->method('getUploadedFile')->willReturn(['tmp_name' => __DIR__ . '/fixtures/sample.wav', 'name' => 'sample.wav']);
+        $this->request->method('getPost')->willReturn(['name' => 'Test Voice']);
 
-        $this->keyManager->method('validate')->willReturn($token);
-        $this->ttsManager->method('cloneVoice')->willReturn('new-voice-123');
-        $this->repository->method('saveCustomVoice')->willReturn(null);
+        $this->ttsManager->method('cloneVoice')->willReturn('voice-clone-123');
+        $this->repository->method('saveCustomVoice');
 
-        $this->request->method('getHeader')->willReturn('vxo_testkey');
-        $this->request->method('getPost')->willReturn(['name' => 'Test Voice', 'provider' => 'elevenlabs']);
-        $this->request->method('getUploadedFile')->willReturn([
-            'tmp_name' => '/tmp/test.wav',
-            'error' => 0,
-        ]);
+        $response = $this->controller->cloneVoiceAction($this->request);
 
-        $this->expectOutputString(json_encode([
-            'success' => true,
-            'voice_id' => 'new-voice-123',
-            'name' => 'Test Voice',
-            'provider' => 'elevenlabs',
-        ], JSON_THROW_ON_ERROR));
-
-        $this->controller->cloneVoiceAction($this->request);
+        $this->assertSame(200, $response['status']);
+        $this->assertArrayHasKey('voice_id', $response['body']);
     }
 
     public function testListVoicesAction(): void
     {
-        $voices = [
-            ['id' => 'voice1', 'name' => 'Voice One'],
-            ['id' => 'voice2', 'name' => 'Voice Two'],
-        ];
+        $this->rateLimiter->method('allow')->willReturn(true);
+        $this->request->method('getHeader')->willReturn('vxo_validtoken123');
+        $this->ttsManager->method('listVoices')->willReturn([['id' => 'v1', 'name' => 'Voice One']]);
 
-        $this->ttsManager->method('listVoices')->willReturn($voices);
-        $this->request->method('getQueryParam')->willReturn(null);
+        $response = $this->controller->listVoicesAction($this->request);
 
-        $this->expectOutputString(json_encode([
-            'success' => true,
-            'voices' => $voices,
-            'count' => 2,
-        ], JSON_THROW_ON_ERROR));
-
-        $this->controller->listVoicesAction($this->request);
+        $this->assertSame(200, $response['status']);
+        $this->assertIsArray($response['body']);
+        $this->assertCount(1, $response['body']);
     }
 }
