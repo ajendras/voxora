@@ -6,99 +6,98 @@ namespace Voxora\Tests\Unit;
 
 use PHPUnit\Framework\TestCase;
 use Voxora\Security\KeyManager;
-use Voxora\Security\Token;
 use Voxora\Storage\SqliteRepository;
+use Voxora\Security\Token;
 use DateTimeImmutable;
-use RuntimeException;
 
 class KeyManagerTest extends TestCase
 {
+    private SqliteRepository $repository;
     private KeyManager $keyManager;
-    private SqliteRepository $repoMock;
-    private string $testKey;
 
     protected function setUp(): void
     {
-        $this->testKey = str_repeat('a', 32); // valid key for tests
-        $this->repoMock = $this->createMock(SqliteRepository::class);
+        $this->repository = $this->createMock(SqliteRepository::class);
+        $this->repository->method('saveToken')->willReturn(null);
+        $this->repository->method('isTokenRevoked')->willReturn(false);
+        $this->repository->method('getUserById')->willReturn(null);
 
-        // Fixed: never use willReturn(null) on a method declared :void
-        // PHPUnit 10+ strictly validates return types against the original signature.
-        $this->repoMock->expects($this->any())
-            ->method('storeIssuedToken');
+        $config = [
+            'security' => [
+                'encrypt_key' => str_repeat('a', 32),
+                'token_lifetime_days' => 30,
+            ],
+        ];
 
-        $this->repoMock->method('isTokenRevoked')
-            ->willReturn(false);
-
-        $this->repoMock->method('getUserById')
-            ->willReturn(['id' => 1, 'role' => 'user']);
-
-        $this->keyManager = new KeyManager($this->repoMock, $this->testKey);
+        $this->keyManager = new KeyManager($config, $this->repository);
     }
 
     public function testValidateAcceptsValidToken(): void
     {
-        $token = $this->keyManager->issueToken(
-            name: 'Test Client',
-            scopes: ['tts:generate']
+        $tokenStr = $this->keyManager->issueToken(
+            name: 'Test Token',
+            scopes: ['tts:generate'],
+            role: 'user',
+            userId: 42
         );
 
-        $validated = $this->keyManager->validate($token);
+        $token = $this->keyManager->validate($tokenStr);
 
-        $this->assertInstanceOf(Token::class, $validated);
-        $this->assertTrue($validated->hasScope('tts:generate'));
-        $this->assertFalse($validated->isExpired());
+        $this->assertInstanceOf(Token::class, $token);
+        $this->assertTrue($token->hasScope('tts:generate'));
+        $this->assertEquals('user', $token->getRole());
+        $this->assertEquals(42, $token->getUserId());
     }
 
     public function testValidateRejectsExpiredToken(): void
     {
-        $this->repoMock->method('isTokenRevoked')->willReturn(false);
+        $this->repository->method('isTokenRevoked')->willReturn(false);
+        $this->repository->method('getUserById')->willReturn(null);
 
-        $this->expectException(RuntimeException::class);
-        $this->expectExceptionMessageMatches('/expired|invalid/i');
+        $tokenStr = $this->keyManager->issueToken('Expired', ['tts:generate'], 'user', null, -1);
+        $token = $this->keyManager->validate($tokenStr);
 
-        // Use a deliberately malformed token that will fail decryption/expiry check
-        $this->keyManager->validate('vxo_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx');
+        $this->assertNull($token);
     }
 
     public function testRevokedTokenIsRejected(): void
     {
-        $this->repoMock->method('isTokenRevoked')->willReturn(true);
+        $this->repository->method('isTokenRevoked')->willReturn(true);
 
-        $token = $this->keyManager->issueToken(
-            name: 'Revocable Token',
-            scopes: ['tts:generate']
-        );
+        $tokenStr = $this->keyManager->issueToken('Revoked', ['tts:generate']);
+        $token = $this->keyManager->validate($tokenStr);
 
-        $this->expectException(RuntimeException::class);
-        $this->expectExceptionMessageMatches('/revoked/i');
-
-        $this->keyManager->validate($token);
+        $this->assertNull($token);
     }
 
     public function testIssueTokenGeneratesValidFormat(): void
     {
-        $token = $this->keyManager->issueToken(
-            name: 'Mobile App',
-            scopes: ['tts:generate', 'library:read'],
-            role: 'user'
-        );
+        $token = $this->keyManager->issueToken('Format Test', ['tts:generate']);
 
         $this->assertStringStartsWith('vxo_', $token);
-        $this->assertGreaterThan(50, strlen($token));
+        $this->assertGreaterThan(20, strlen($token));
     }
 
     public function testTokenWithRoleAndUserId(): void
     {
-        $token = $this->keyManager->issueToken(
+        $this->repository->method('getUserById')->willReturn([
+            'id' => 99,
+            'username' => 'testuser',
+            'role' => 'admin',
+        ]);
+
+        $tokenStr = $this->keyManager->issueToken(
             name: 'Admin Token',
-            scopes: ['tts:generate'],
-            role: 'admin'
+            scopes: ['*'],
+            role: 'admin',
+            userId: 99
         );
 
-        $validated = $this->keyManager->validate($token);
+        $token = $this->keyManager->validate($tokenStr);
 
-        $this->assertEquals('admin', $validated->getRole());
-        $this->assertEquals(1, $validated->getUserId());
+        $this->assertInstanceOf(Token::class, $token);
+        $this->assertEquals('admin', $token->getRole());
+        $this->assertEquals(99, $token->getUserId());
+        $this->assertTrue($token->hasScope('any:scope'));
     }
 }

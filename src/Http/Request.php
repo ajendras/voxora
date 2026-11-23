@@ -4,121 +4,85 @@ declare(strict_types=1);
 
 namespace Voxora\Http;
 
-use InvalidArgumentException;
-
 /**
- * Request
- *
- * Lightweight immutable wrapper around HTTP request data to improve testability
- * and decouple controllers from superglobals. Supports query, post, files, headers
- * and JSON body. Used by ApiController and DashboardController actions.
+ * Simple immutable request wrapper for API and dashboard controllers.
+ * Provides normalized header access, POST/GET data, uploaded files and body.
  */
 final class Request
 {
-    public function __construct(
-        private readonly array $query = [],
-        private readonly array $post = [],
-        private readonly array $files = [],
-        private readonly array $headers = [],
-        private readonly ?array $parsedJson = null
-    ) {
+    /** @var array<string, string> */
+    private array $headers = [];
+
+    /** @var array<string, mixed> */
+    private array $post = [];
+
+    /** @var array<string, mixed> */
+    private array $query = [];
+
+    /** @var array<string, array<string, mixed>> */
+    private array $files = [];
+
+    public function __construct()
+    {
+        $this->headers = $this->parseHeaders($_SERVER);
+        $this->post = $_POST;
+        $this->query = $_GET;
+        $this->files = $_FILES;
     }
 
-    public function get(string $key, mixed $default = null): mixed
+    /**
+     * @param array<string, string> $server
+     * @return array<string, string>
+     */
+    private function parseHeaders(array $server): array
     {
-        return $this->post[$key] ?? $this->query[$key] ?? $default;
-    }
-
-    public function getString(string $key, string $default = ''): string
-    {
-        $value = $this->get($key);
-
-        if (is_string($value)) {
-            return trim($value);
+        $headers = [];
+        foreach ($server as $key => $value) {
+            if (str_starts_with($key, 'HTTP_')) {
+                $name = str_replace(' ', '-', ucwords(strtolower(str_replace('_', ' ', substr($key, 5)))));
+                $headers[$name] = (string) $value;
+            }
         }
-
-        return $default;
-    }
-
-    public function input(string $key, mixed $default = null): mixed
-    {
-        return $this->get($key, $default);
-    }
-
-    public function has(string $key): bool
-    {
-        return isset($this->post[$key]) || isset($this->query[$key]);
-    }
-
-    public function header(string $key, ?string $default = null): ?string
-    {
-        $key = strtoupper(str_replace('-', '_', $key));
-
-        if (isset($this->headers[$key])) {
-            return (string) $this->headers[$key];
+        if (isset($server['CONTENT_TYPE'])) {
+            $headers['Content-Type'] = (string) $server['CONTENT_TYPE'];
         }
-
-        if (isset($this->headers['HTTP_' . $key])) {
-            return (string) $this->headers['HTTP_' . $key];
-        }
-
-        return $default;
+        return $headers;
     }
 
-    public function bearerToken(): ?string
+    public function getHeader(string $name): ?string
     {
-        $header = $this->header('Authorization') ?? $this->header('X-Api-Key');
-
-        if ($header && preg_match('/^Bearer\s+(.+)$/i', $header, $matches)) {
-            return $matches[1];
-        }
-
-        return $header;
+        $normalized = str_replace(' ', '-', ucwords(strtolower(str_replace('-', ' ', $name))));
+        return $this->headers[$normalized] ?? null;
     }
 
-    public function file(string $key): ?array
+    public function getMethod(): string
+    {
+        return strtoupper($_SERVER['REQUEST_METHOD'] ?? 'GET');
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    public function getPost(): array
+    {
+        return $this->post;
+    }
+
+    public function getQueryParam(string $name, mixed $default = null): mixed
+    {
+        return $this->query[$name] ?? $default;
+    }
+
+    /**
+     * @return array<string, mixed>|null
+     */
+    public function getUploadedFile(string $key): ?array
     {
         return $this->files[$key] ?? null;
     }
 
-    public function json(?string $key = null): mixed
+    public function getBody(): string
     {
-        if ($this->parsedJson === null) {
-            return null;
-        }
-
-        if ($key === null) {
-            return $this->parsedJson;
-        }
-
-        return $this->parsedJson[$key] ?? null;
-    }
-
-    public static function createFromGlobals(): self
-    {
-        $headers = [];
-        foreach ($_SERVER as $name => $value) {
-            if (str_starts_with($name, 'HTTP_')) {
-                $headers[substr($name, 5)] = $value;
-            } elseif (in_array($name, ['CONTENT_TYPE', 'CONTENT_LENGTH'], true)) {
-                $headers[$name] = $value;
-            }
-        }
-
-        $json = null;
-        if (str_contains($_SERVER['CONTENT_TYPE'] ?? '', 'application/json')) {
-            $input = file_get_contents('php://input');
-            if ($input !== false) {
-                $json = json_decode($input, true);
-            }
-        }
-
-        return new self(
-            query: $_GET,
-            post: $_POST,
-            files: $_FILES,
-            headers: $headers,
-            parsedJson: $json
-        );
+        return file_get_contents('php://input') ?: '';
     }
 }

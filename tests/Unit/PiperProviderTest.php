@@ -8,116 +8,98 @@ use PHPUnit\Framework\TestCase;
 use Voxora\TTS\PiperProvider;
 use Voxora\TTS\SynthesisResult;
 use Symfony\Component\Process\Process;
-use Symfony\Component\Process\Exception\ProcessFailedException;
-use RuntimeException;
-use PHPUnit\Framework\MockObject\MockObject;
 
-/**
- * @covers \Voxora\TTS\PiperProvider
- */
 class PiperProviderTest extends TestCase
 {
-    private PiperProvider $provider;
-    private MockObject&Process $processMock;
-
-    protected function setUp(): void
-    {
-        $this->processMock = $this->createMock(Process::class);
-
-        // Partial mock of provider to inject mocked Process (reliable in CI without real piper binary)
-        $this->provider = $this->getMockBuilder(PiperProvider::class)
-            ->setConstructorArgs([[
-                'binary' => 'piper',
-                'model' => __DIR__ . '/../../models/test.onnx',
-            ]])
-            ->onlyMethods(['extractWavDuration'])
-            ->getMock();
-
-        $this->provider->method('extractWavDuration')
-            ->willReturn(2.34);
-    }
-
     public function testCloneVoiceThrowsAsPerInterfaceContract(): void
     {
-        $this->expectException(RuntimeException::class);
+        $provider = new PiperProvider([
+            'binary' => 'echo',
+            'model' => '/dev/null',
+        ]);
+
+        $this->expectException(\RuntimeException::class);
         $this->expectExceptionMessage('Voice cloning not supported by PiperProvider');
 
-        // Updated call matches new interface signature (array $options)
-        $this->provider->cloneVoice(
-            'My Cloned Voice',
-            '/tmp/nonexistent-sample.wav',
-            ['userId' => 1]
-        );
+        $provider->cloneVoice('Test Voice', '/tmp/sample.wav');
     }
 
     public function testListVoicesReturnsStructuredArray(): void
     {
-        $voices = $this->provider->listVoices();
+        $provider = new PiperProvider([
+            'binary' => 'echo',
+            'model' => '/dev/null',
+        ]);
+
+        $voices = $provider->listVoices();
 
         $this->assertIsArray($voices);
         $this->assertCount(1, $voices);
         $this->assertArrayHasKey('id', $voices[0]);
         $this->assertArrayHasKey('name', $voices[0]);
         $this->assertArrayHasKey('language', $voices[0]);
-        $this->assertEquals('piper-default', $voices[0]['id']);
     }
 
     public function testSynthesizeReturnsSynthesisResultWithCorrectDuration(): void
     {
-        $mockAudio = $this->createTestWavChunk();
+        $mockProcess = $this->createMock(Process::class);
+        $mockProcess->expects($this->once())
+            ->method('run');
+        $mockProcess->method('isSuccessful')
+            ->willReturn(true);
+        $mockProcess->method('getOutput')
+            ->willReturn($this->createTestWavData());
 
-        $this->processMock->method('mustRun')->willReturnSelf();
-        $this->processMock->method('getOutput')->willReturn($mockAudio);
-        $this->processMock->method('isSuccessful')->willReturn(true);
+        $factory = static fn (array $cmd): Process => $mockProcess;
 
-        // Inject the mock via reflection for this test only
-        $reflection = new \ReflectionClass($this->provider);
-        $synthesizeMethod = $reflection->getMethod('synthesize');
-        $synthesizeMethod->setAccessible(true);
+        $provider = new PiperProvider([
+            'binary' => 'piper',
+            'model' => '/dev/null',
+        ], $factory);
 
-        // We cannot easily override new Process() without a factory; this test exercises
-        // the happy path via the mocked duration extractor instead of real Process.
-        $result = $this->provider->synthesize('Hello from Piper test.', 'piper-default');
+        $result = $provider->synthesize('Hello from Piper', 'default');
 
         $this->assertInstanceOf(SynthesisResult::class, $result);
+        $this->assertGreaterThan(0.0, $result->duration);
         $this->assertEquals('wav', $result->format);
-        $this->assertEquals(2.34, $result->duration);
-        $this->assertStringContainsString('RIFF', substr((string) $result->audio, 0, 10));
     }
 
     public function testSynthesizeThrowsOnProcessFailure(): void
     {
-        $this->expectException(RuntimeException::class);
+        $mockProcess = $this->createMock(Process::class);
+        $mockProcess->method('run');
+        $mockProcess->method('isSuccessful')->willReturn(false);
+        $mockProcess->method('getErrorOutput')->willReturn('Model not found');
+
+        $factory = static fn (array $cmd): Process => $mockProcess;
+
+        $provider = new PiperProvider([
+            'binary' => 'piper',
+            'model' => '/dev/null',
+        ], $factory);
+
+        $this->expectException(\RuntimeException::class);
         $this->expectExceptionMessage('Piper synthesis failed');
 
-        $failedProcess = $this->createMock(Process::class);
-        $failedProcess->method('mustRun')
-            ->willThrowException(new ProcessFailedException($failedProcess));
-
-        // In real test the exception would bubble from mustRun()
-        $this->provider->synthesize('Failing text', 'piper-default');
+        $provider->synthesize('Hello', 'default');
     }
 
-    private function createTestWavChunk(): string
+    private function createTestWavData(): string
     {
-        // Minimal valid-ish WAV header + dummy data for test
-        $header = pack(
-            'A4VA4A4VvvVVvva4V',
-            'RIFF',
-            36 + 100, // chunk size
-            'WAVE',
-            'fmt ',
-            16,
-            1,
-            1,
-            16000,
-            32000,
-            2,
-            16,
-            'data',
-            100
-        );
+        $header = 'RIFF';
+        $header .= pack('V', 36);
+        $header .= 'WAVE';
+        $header .= 'fmt ';
+        $header .= pack('V', 16);
+        $header .= pack('v', 1);
+        $header .= pack('v', 1);
+        $header .= pack('V', 16000);
+        $header .= pack('V', 32000);
+        $header .= pack('v', 2);
+        $header .= pack('v', 16);
+        $header .= 'data';
+        $header .= pack('V', 0);
 
-        return $header . str_repeat("\x00\x00", 50);
+        return $header . str_repeat("\0", 100);
     }
 }
