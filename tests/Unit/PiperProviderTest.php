@@ -9,70 +9,81 @@ use Voxora\TTS\PiperProvider;
 use Voxora\TTS\SynthesisResult;
 use Symfony\Component\Process\Process;
 use RuntimeException;
-use ReflectionProperty;
 
-class PiperProviderTest extends TestCase
+final class PiperProviderTest extends TestCase
 {
-    private PiperProvider $provider;
-    private array $config;
-
-    protected function setUp(): void
+    public function testSynthesizeReturnsSynthesisResultWithCorrectDuration(): void
     {
-        $this->config = [
-            'binary' => 'piper',
-            'model' => __DIR__ . '/../../models/en_US-lessac-medium.onnx',
-        ];
-        $this->provider = new PiperProvider($this->config);
-    }
-
-    public function testSynthesizeReturnsSynthesisResultWithCorrectDuration()
-    {
+        $fakeWav = $this->createFakeWavWithDuration(4.75);
         $mockProcess = $this->createMock(Process::class);
+
         $mockProcess->expects($this->once())
-            ->method('run')
-            ->willReturn(0);
+            ->method('setInput')
+            ->with('Hello from Piper test');
+
+        $mockProcess->expects($this->once())
+            ->method('run');
+
+        $mockProcess->expects($this->once())
+            ->method('isSuccessful')
+            ->willReturn(true);
+
         $mockProcess->expects($this->once())
             ->method('getOutput')
-            ->willReturn($this->createTestWavData(4.8));
-        $mockProcess->expects($this->once())
-            ->method('getErrorOutput')
-            ->willReturn('');
+            ->willReturn($fakeWav);
 
-        $provider = new PiperProvider($this->config);
-        $this->injectProcessFactory($provider, fn() => $mockProcess);
+        $factory = static fn (array $command): Process => $mockProcess;
 
-        $result = $provider->synthesize('Hello from Piper test.', 'en_US-lessac-medium');
+        $provider = new PiperProvider([
+            'binary' => 'piper',
+            'model' => '/tmp/test.onnx',
+        ], $factory);
+
+        $result = $provider->synthesize('Hello from Piper test', 'default');
 
         $this->assertInstanceOf(SynthesisResult::class, $result);
-        $this->assertEquals('wav', $result->format);
-        $this->assertEqualsWithDelta(4.8, $result->duration, 0.1);
+        $this->assertSame('wav', $result->format);
+        $this->assertSame(4.75, $result->duration);
+        $this->assertSame($fakeWav, $result->audio);
     }
 
-    public function testCloneVoiceThrowsException()
+    public function testListVoicesReturnsExpectedStructure(): void
     {
-        $this->expectException(RuntimeException::class);
-        $this->expectExceptionMessage('Voice cloning not supported by PiperProvider. Use ElevenLabs instead.');
+        $provider = new PiperProvider([
+            'binary' => 'piper',
+            'model' => '/tmp/test.onnx',
+        ]);
 
-        $this->provider->cloneVoice('Test Voice', '/tmp/nonexistent.wav');
-    }
+        $voices = $provider->listVoices();
 
-    public function testListVoicesReturnsArrayWithExpectedStructure()
-    {
-        $voices = $this->provider->listVoices();
         $this->assertIsArray($voices);
-        $this->assertNotEmpty($voices);
+        $this->assertCount(1, $voices);
         $this->assertArrayHasKey('id', $voices[0]);
         $this->assertArrayHasKey('name', $voices[0]);
+        $this->assertSame('default', $voices[0]['id']);
     }
 
-    private function createTestWavData(float $durationSeconds): string
+    public function testCloneVoiceThrowsException(): void
+    {
+        $provider = new PiperProvider([
+            'binary' => 'piper',
+            'model' => '/tmp/test.onnx',
+        ]);
+
+        $this->expectException(RuntimeException::class);
+        $this->expectExceptionMessage('Voice cloning not supported by PiperProvider');
+
+        $provider->cloneVoice('Test Voice', '/tmp/sample.wav');
+    }
+
+    private function createFakeWavWithDuration(float $duration): string
     {
         $sampleRate = 22050;
         $channels = 1;
         $bitsPerSample = 16;
         $byteRate = $sampleRate * $channels * ($bitsPerSample / 8);
-        $dataSize = (int) ($durationSeconds * $byteRate);
-        $fileSize = 36 + $dataSize;
+        $dataSize = (int) ($duration * $byteRate);
+        $fileSize = 36 + 8 + $dataSize;
 
         $header = 'RIFF';
         $header .= pack('V', $fileSize);
@@ -83,18 +94,13 @@ class PiperProviderTest extends TestCase
         $header .= pack('v', $channels);
         $header .= pack('V', $sampleRate);
         $header .= pack('V', $byteRate);
-        $header .= pack('v', $channels * ($bitsPerSample / 8));
+        $header .= pack('v', $channels * $bitsPerSample / 8);
         $header .= pack('v', $bitsPerSample);
         $header .= 'data';
         $header .= pack('V', $dataSize);
 
-        return $header . str_repeat("\x00", $dataSize);
-    }
+        $data = str_repeat("\x00", $dataSize);
 
-    private function injectProcessFactory(PiperProvider $provider, callable $factory): void
-    {
-        $reflection = new ReflectionProperty(PiperProvider::class, 'processFactory');
-        $reflection->setAccessible(true);
-        $reflection->setValue($provider, $factory);
+        return $header . $data;
     }
 }
