@@ -6,46 +6,38 @@ namespace Voxora\Tests\Unit;
 
 use PHPUnit\Framework\TestCase;
 use Voxora\Http\ApiController;
+use Voxora\Http\Request;
 use Voxora\Security\KeyManager;
+use Voxora\Security\Token;
 use Voxora\TTS\Manager;
 use Voxora\Storage\SqliteRepository;
-use Voxora\Security\RateLimiter;
 use Voxora\TTS\WebhookDispatcher;
+use Voxora\Security\RateLimiter;
 use PHPUnit\Framework\MockObject\MockObject;
-use Voxora\Http\Request;
+use RuntimeException;
 
 class ApiControllerTest extends TestCase
 {
     private ApiController $controller;
+    private KeyManager&MockObject $keyManager;
+    private Manager&MockObject $ttsManager;
     private SqliteRepository $repository;
-    private KeyManager $keyManager;
-    private Manager|MockObject $ttsManager;
-    private RateLimiter|MockObject $rateLimiter;
-    private WebhookDispatcher|MockObject $webhookDispatcher;
     private array $config;
+    private WebhookDispatcher&MockObject $webhookDispatcher;
+    private RateLimiter&MockObject $rateLimiter;
 
     protected function setUp(): void
     {
-        $this->config = [
-            'security' => [
-                'encrypt_key' => str_repeat('k', 32),
-                'token_lifetime_days' => 90,
-            ],
-            'audio' => [
-                'directory' => sys_get_temp_dir(),
-                'public_url_prefix' => '/audio',
-            ],
-            'rate_limit' => [
-                'requests' => 100,
-                'window' => 60,
-            ],
-        ];
-
         $this->repository = new SqliteRepository(':memory:');
-        $this->keyManager = new KeyManager($this->config, $this->repository);
+        $this->config = [
+            'security' => ['encrypt_key' => sodium_crypto_secretbox_keygen()],
+            'audio' => ['directory' => '/tmp', 'public_url_prefix' => '/audio'],
+            'providers' => ['elevenlabs' => ['api_key' => 'test']],
+        ];
+        $this->keyManager = $this->createMock(KeyManager::class);
         $this->ttsManager = $this->createMock(Manager::class);
-        $this->rateLimiter = $this->createMock(RateLimiter::class);
         $this->webhookDispatcher = $this->createMock(WebhookDispatcher::class);
+        $this->rateLimiter = $this->createMock(RateLimiter::class);
 
         $this->controller = new ApiController(
             $this->keyManager,
@@ -57,63 +49,65 @@ class ApiControllerTest extends TestCase
         );
     }
 
-    public function testObjectsInvalidToken(): void
+    public function testObjectsInvalidToken()
     {
-        $request = $this->createMock(Request::class);
-        $request->method('getHeader')
-            ->with('X-Api-Key')
-            ->willReturn('vxo_invalidtoken123');
+        $this->keyManager->method('validate')
+            ->willThrowException(new RuntimeException('Invalid or expired token'));
 
-        $this->rateLimiter->method('allow')->willReturn(true);
+        $request = $this->createMockRequest('POST', '/api/v1/speech', ['X-Api-Key' => 'invalid-token']);
 
         $response = $this->controller->speechAction($request);
 
-        $this->assertArrayHasKey('error', $response);
-        $this->assertEquals(401, $response['status'] ?? 401);
+        $this->assertEquals(401, $response['status']);
+        $this->assertStringContainsString('Invalid', $response['body']);
     }
 
-    public function testCloneVoiceActionSuccess(): void
+    public function testCloneVoiceActionSuccess()
     {
+        $token = new Token('test-token', ['tts:generate'], 'user', 1, new DateTimeImmutable('+30 days'));
+        $this->keyManager->method('validate')->willReturn($token);
         $this->rateLimiter->method('allow')->willReturn(true);
-        $this->ttsManager->method('cloneVoice')
-            ->willReturn('cloned-voice-12345');
+        $this->ttsManager->method('cloneVoice')->willReturn('cloned-voice-12345');
 
-        $validToken = $this->keyManager->issueToken('test-clone', ['tts:clone']);
-        $request = $this->createMock(Request::class);
-        $request->method('getHeader')
-            ->with('X-Api-Key')
-            ->willReturn($validToken);
-        $request->method('getUploadedFile')->willReturn([
-            'name' => 'sample.wav',
-            'tmp_name' => __DIR__ . '/fixtures/sample.wav',
-        ]);
-        $request->method('getPost')->willReturn(['name' => 'Test Clone']);
+        $request = $this->createMockRequest(
+            'POST',
+            '/api/v1/clone-voice',
+            ['X-Api-Key' => 'valid-token'],
+            ['name' => 'Test Clone', 'sample' => ['tmp_name' => __FILE__, 'name' => 'test.wav']]
+        );
 
         $response = $this->controller->cloneVoiceAction($request);
 
-        $this->assertArrayHasKey('voice_id', $response);
-        $this->assertEquals('cloned-voice-12345', $response['voice_id']);
+        $this->assertEquals(200, $response['status']);
+        $data = json_decode($response['body'], true, 512, JSON_THROW_ON_ERROR);
+        $this->assertEquals('cloned-voice-12345', $data['voice_id']);
     }
 
-    public function testListVoicesAction(): void
+    public function testListVoicesAction()
     {
+        $token = new Token('test-token', ['tts:generate'], 'user', 1, new DateTimeImmutable('+30 days'));
+        $this->keyManager->method('validate')->willReturn($token);
         $this->rateLimiter->method('allow')->willReturn(true);
-        $this->ttsManager->method('listVoices')
-            ->willReturn([
-                ['id' => 'voice1', 'name' => 'Voice One'],
-                ['id' => 'voice2', 'name' => 'Voice Two'],
-            ]);
+        $this->ttsManager->method('listVoices')->willReturn([
+            ['id' => 'voice1', 'name' => 'Test Voice'],
+        ]);
 
-        $request = $this->createMock(Request::class);
-        $request->method('getHeader')->willReturn(
-            $this->keyManager->issueToken('test-list', ['tts:generate'])
-        );
-        $request->method('getQuery')->willReturn([]);
+        $request = $this->createMockRequest('GET', '/api/v1/voices', ['X-Api-Key' => 'valid-token']);
 
         $response = $this->controller->listVoicesAction($request);
 
-        $this->assertIsArray($response);
-        $this->assertCount(2, $response);
-        $this->assertArrayHasKey('id', $response[0]);
+        $this->assertEquals(200, $response['status']);
+        $data = json_decode($response['body'], true, 512, JSON_THROW_ON_ERROR);
+        $this->assertArrayHasKey('voices', $data);
+        $this->assertCount(1, $data['voices']);
+    }
+
+    private function createMockRequest(string $method, string $path, array $headers = [], array $post = []): Request
+    {
+        $query = [];
+        if (str_contains($path, '?')) {
+            parse_str(parse_url($path, PHP_URL_QUERY) ?? '', $query);
+        }
+        return new Request($method, $path, $query, $headers, $post);
     }
 }

@@ -7,81 +7,101 @@ namespace Voxora\Tests\Unit;
 use PHPUnit\Framework\TestCase;
 use Voxora\Security\KeyManager;
 use Voxora\Storage\SqliteRepository;
+use RuntimeException;
 use DateTimeImmutable;
 
 class KeyManagerTest extends TestCase
 {
     private KeyManager $keyManager;
     private SqliteRepository $repository;
-    private array $config;
 
     protected function setUp(): void
     {
-        $this->config = [
+        $this->repository = new SqliteRepository(':memory:');
+        $config = [
             'security' => [
-                'encrypt_key' => str_repeat('k', 32),
+                'encrypt_key' => sodium_crypto_secretbox_keygen(),
                 'token_lifetime_days' => 90,
             ],
         ];
-
-        $this->repository = new SqliteRepository(':memory:');
-        $this->keyManager = new KeyManager($this->config, $this->repository);
+        $this->keyManager = new KeyManager($this->repository, $config);
     }
 
-    public function testValidateAcceptsValidToken(): void
+    public function testIssueTokenAndValidateSuccess()
     {
-        $token = $this->keyManager->issueToken('test-valid', ['tts:generate']);
-        $validated = $this->keyManager->validate($token);
+        $token = $this->keyManager->issueToken(
+            name: 'Test Token',
+            scopes: ['tts:generate'],
+            role: 'user',
+            userId: null,
+            expiresInDays: 30
+        );
 
+        $this->assertIsString($token);
+        $this->assertStringStartsWith('vxo_', $token);
+
+        $validated = $this->keyManager->validate($token);
+        $this->assertInstanceOf(\Voxora\Security\Token::class, $validated);
         $this->assertTrue($validated->hasScope('tts:generate'));
     }
 
-    public function testValidateRejectsExpiredToken(): void
+    public function testValidateRejectsExpiredToken()
     {
-        $this->expectException(\RuntimeException::class);
+        $this->expectException(RuntimeException::class);
+        $this->expectExceptionMessage('Token has expired');
 
-        $expiredToken = $this->keyManager->issueToken(
-            'test-expired',
-            ['tts:generate'],
-            'user',
-            null,
-            (new DateTimeImmutable())->modify('-10 days')
+        $token = $this->keyManager->issueToken(
+            name: 'Expired Token',
+            scopes: ['tts:generate'],
+            role: 'user',
+            userId: null,
+            expiresInDays: 1
         );
 
-        $this->keyManager->validate($expiredToken);
-    }
-
-    public function testRevokedTokenIsRejected(): void
-    {
-        $token = $this->keyManager->issueToken('test-revoked', ['tts:generate']);
-        $this->keyManager->revokeToken($token);
-
-        $this->expectException(\RuntimeException::class);
-        $this->expectExceptionMessageMatches('/revoked/');
+        $this->repository->pdo->exec("
+            UPDATE tokens 
+            SET expires_at = datetime('now', '-2 days')
+            WHERE token_hash = (SELECT token_hash FROM tokens ORDER BY id DESC LIMIT 1)
+        ");
 
         $this->keyManager->validate($token);
     }
 
-    public function testIssueTokenGeneratesValidFormat(): void
+    public function testRevokedTokenIsRejected()
     {
-        $token = $this->keyManager->issueToken('test-format', ['tts:generate']);
+        $tokenStr = $this->keyManager->issueToken(
+            name: 'Revocable Token',
+            scopes: ['tts:generate'],
+            role: 'user',
+            userId: null,
+            expiresInDays: 30
+        );
 
-        $this->assertStringStartsWith('vxo_', $token);
-        $this->assertGreaterThan(30, strlen($token));
+        $token = $this->keyManager->validate($tokenStr);
+        $hash = hash('sha256', $tokenStr);
+
+        $this->repository->revokeToken($hash);
+
+        $this->expectException(RuntimeException::class);
+        $this->expectExceptionMessage('Token has been revoked');
+
+        $this->keyManager->validate($tokenStr);
     }
 
-    public function testTokenWithRoleAndUserId(): void
+    public function testTokenWithInvalidScopeIsRejected()
     {
+        $this->expectException(RuntimeException::class);
+        $this->expectExceptionMessage('Insufficient scope');
+
         $token = $this->keyManager->issueToken(
-            'test-role',
-            ['tts:generate'],
-            'admin',
-            42
+            name: 'Limited Token',
+            scopes: ['tts:generate'],
+            role: 'user',
+            userId: null,
+            expiresInDays: 30
         );
 
         $validated = $this->keyManager->validate($token);
-
-        $this->assertEquals('admin', $validated->getRole());
-        $this->assertEquals(42, $validated->getUserId());
+        $validated->requireScope('admin:full');
     }
 }
