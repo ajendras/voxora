@@ -4,69 +4,59 @@ declare(strict_types=1);
 
 namespace Voxora\TTS;
 
-use Voxora\TTS\SynthesisResult;
 use RuntimeException;
 
 /**
  * ProviderInterface
  *
- * Contract that every TTS backend (built-in or custom) must implement.
- * The dedicated guide in README.md ("Implementing and registering custom TTS providers")
- * contains a full walk-through, a complete working example, registration patterns
- * (runtime + config-driven), best practices and integration notes.
- *
- * Implementing this interface automatically makes the provider available in:
- *  - Dashboard dropdown and voice selector
- *  - REST API (provider parameter)
- *  - BatchGenerator (CSV provider column)
- *  - Scheduler jobs
- *  - Manager::listVoices() and analytics
- *  - Caching, FFmpeg post-processing, webhooks and Piper fallback (all handled by Manager)
+ * Contract for all TTS backends. Implement this to add new providers via the
+ * plugin system. The TTS\Manager routes calls, applies caching, post-processing,
+ * fallback and usage tracking automatically.
  */
 interface ProviderInterface
 {
     /**
-     * Synthesize speech from text (or SSML).
+     * Generate speech audio for the given text and voice.
      *
-     * The Manager will call this method only on cache miss. It automatically:
-     *  - records usage stats
-     *  - stores the result in SQLite
-     *  - applies FFmpeg normalization/conversion when options request it
-     *  - dispatches webhooks
+     * SSML support is provider-dependent. ElevenLabs and Piper accept limited SSML;
+     * OpenAIProvider automatically strips tags.
      *
-     * @param string $text Text or SSML fragment. Providers that do not support SSML should strip tags.
-     * @param string $voiceId Provider-specific voice identifier.
-     * @param array<string, mixed> $options Optional settings (format, model, speed, normalize, target_loudness, ...).
-     *        The key 'format' should be respected ('mp3' or 'wav').
-     * @return SynthesisResult Binary audio content, format and duration (seconds).
-     * @throws RuntimeException On any failure (network error, invalid voice, quota, etc.).
-     *         The Manager will fallback to Piper when configured.
+     * Provider-specific parameters are supported through the $options array and
+     * forwarded/normalized by Manager::generate() and Manager::normalizeOptions():
+     *  - stability (float 0-1): voice stability (ElevenLabs)
+     *  - similarity (float 0-1): similarity boost (ElevenLabs, mapped to similarity_boost)
+     *  - style (float 0-1): speaking style/exaggeration (ElevenLabs)
+     *  - speed (float): speech rate. OpenAI 0.25-4.0, ElevenLabs ~0.5-2.0
+     * Other common options:
+     *  - format: 'mp3' or 'wav'
+     *  - model: backend model identifier
+     *  - normalize: bool - whether SynthesisResult should run FFmpeg loudnorm
+     *  - target_loudness: float - LUFS target for normalization
+     *
+     * @param string $text Input text (or SSML)
+     * @param string $voiceId Voice identifier
+     * @param array $options Provider-specific and common options
+     * @return SynthesisResult Audio bytes, format and duration
+     * @throws RuntimeException If the provider fails (triggers fallback if configured)
      */
     public function synthesize(string $text, string $voiceId, array $options = []): SynthesisResult;
 
     /**
-     * Return the list of voices this provider supports.
+     * Return list of available voices.
      *
-     * Used by the dashboard, API endpoint /api/v1/voices, Manager::listVoices()
-     * and analytics breakdown. The array shape must be consistent across providers.
-     *
-     * @return array<int, array<string, string>> Each voice must contain at least:
-     *         'id' (string), 'name' (string). Recommended extra keys: 'language', 'gender', 'description'.
+     * Each voice must contain at least 'id' and 'name'. Additional recommended keys:
+     * 'language', 'gender', 'description', 'is_cloned'.
      */
     public function listVoices(): array;
 
     /**
      * Create a cloned voice from an audio sample.
      *
-     * The Manager persists the returned voice_id in the voices table (is_cloned = 1)
-     * so it becomes immediately selectable. Providers that do not support cloning
-     * (e.g. Piper) must throw an exception with a clear message.
-     *
-     * @param string $name Human-readable name for the new voice.
-     * @param string $samplePath Absolute path to a WAV or MP3 sample file.
-     * @param array<string, mixed> $options Extra options (description, stability, similarity, ...).
-     * @return string The provider-assigned voice identifier.
-     * @throws RuntimeException When cloning is unsupported or the operation fails.
+     * @param string $name Name for the new voice
+     * @param string $samplePath Path to audio sample file (WAV/MP3)
+     * @param array $options Additional options (e.g. description, labels)
+     * @return string The new voice ID assigned by the provider
+     * @throws RuntimeException if cloning is not supported by this provider
      */
     public function cloneVoice(string $name, string $samplePath, array $options = []): string;
 }

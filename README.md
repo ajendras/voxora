@@ -878,6 +878,14 @@ The test suite covers `KeyManager` token issuance, validation, expiry checks, en
 - [x] Add pagination and filters to generation history view and API endpoint
 - [x] Provide official Docker Compose file with Redis, Piper and example voices
 - [x] Write dedicated guide for implementing and registering custom TTS providers
+- [x] Add provider-specific parameters (stability, similarity, style, speed) support through TTS\Manager and update ElevenLabsProvider
+- [ ] Replace custom CronExpression with dragonmantank/cron-expression composer dependency for full spec compliance
+- [ ] Add unit and integration test coverage for Scheduler, BatchGenerator and Report classes
+- [ ] Expose X-RateLimit-* response headers in ApiController for client-side rate limit awareness
+- [ ] Implement voice list caching layer (Redis/SQLite) inside TTS\Manager to reduce provider API calls
+- [ ] Add API endpoints in ApiController for full CRUD on scheduled jobs (list, create, update, delete, run)
+- [ ] Write usage examples and configuration reference for scheduled batch jobs in README.md and docs/
+- [ ] Introduce PSR-3 LoggerInterface throughout Scheduler, BatchGenerator and ApiController
 
 > 🤖 This roadmap is worked through continuously — ideas and PRs welcome!
 <!-- roadmap:end -->

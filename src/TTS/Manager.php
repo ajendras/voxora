@@ -5,21 +5,20 @@ declare(strict_types=1);
 namespace Voxora\TTS;
 
 use Voxora\Storage\SqliteRepository;
-use Voxora\TTS\WebhookDispatcher;
-use Symfony\Component\Process\Process;
 use RuntimeException;
 use InvalidArgumentException;
-use DateTimeImmutable;
 
 /**
  * Manager
  *
- * Central orchestrator for TTS operations. Routes calls to registered providers,
- * handles caching via repository, automatic Piper fallback, FFmpeg post-processing,
- * voice cloning and plugin system. No longer marked final so ApiControllerTest
- * can create PHPUnit mocks.
+ * Central facade for all TTS operations. Routes to registered providers,
+ * handles result caching in SQLite, records usage for analytics, applies
+ * FFmpeg post-processing, supports fallback to Piper and dispatches webhooks.
+ * Provider specific parameters (stability, similarity, style, speed) are
+ * normalized, clamped and mapped by normalizeOptions() before being passed
+ * to the underlying provider.
  */
-class Manager
+final class Manager
 {
     /** @var array<string, ProviderInterface> */
     private array $providers = [];
@@ -36,25 +35,19 @@ class Manager
         $this->repository = $repository;
         $this->config = $config;
         $this->webhookDispatcher = $webhookDispatcher;
-
         $this->registerBuiltInProviders();
     }
 
     private function registerBuiltInProviders(): void
     {
-        $providersConfig = $this->config['providers'] ?? [];
+        $elevenConfig = $this->config['providers']['eleven'] ?? $this->config['providers']['elevenlabs'] ?? [];
+        $this->providers['elevenlabs'] = new ElevenLabsProvider($elevenConfig);
 
-        if (isset($providersConfig['eleven']['api_key'])) {
-            $this->providers['elevenlabs'] = new ElevenLabsProvider($providersConfig['eleven']);
-        }
+        $openaiConfig = $this->config['providers']['openai'] ?? [];
+        $this->providers['openai'] = new OpenAIProvider($openaiConfig);
 
-        if (isset($providersConfig['openai']['api_key'])) {
-            $this->providers['openai'] = new OpenAIProvider($providersConfig['openai']);
-        }
-
-        if (isset($providersConfig['piper']['model'])) {
-            $this->providers['piper'] = new PiperProvider($providersConfig['piper']);
-        }
+        $piperConfig = $this->config['providers']['piper'] ?? [];
+        $this->providers['piper'] = new PiperProvider($piperConfig);
     }
 
     public function registerProvider(string $name, ProviderInterface $provider): void
@@ -62,126 +55,192 @@ class Manager
         $this->providers[strtolower(trim($name))] = $provider;
     }
 
+    /**
+     * Generate speech using the selected provider.
+     *
+     * Provider-specific parameters (stability, similarity, style, speed) are
+     * automatically normalized, clamped and mapped by the Manager before
+     * being forwarded to the provider's synthesize() method.
+     */
     public function generate(
         string $text,
         string $voiceId,
         ?string $provider = null,
         array $options = []
     ): SynthesisResult {
-        $providerKey = strtolower($provider ?? 'elevenlabs');
+        $providerName = $this->resolveProviderName($provider);
 
-        if (!isset($this->providers[$providerKey])) {
-            throw new InvalidArgumentException("Unknown provider: {$providerKey}");
+        if (!isset($this->providers[$providerName])) {
+            throw new InvalidArgumentException("Provider '{$providerName}' is not registered.");
         }
 
-        $prov = $this->providers[$providerKey];
-        $textForProvider = ($providerKey === 'openai') ? $this->stripSSML($text) : $text;
+        $providerInstance = $this->providers[$providerName];
+        $normalizedOptions = $this->normalizeOptions($providerName, $options);
 
-        $hash = $this->computeHash($textForProvider, $voiceId, $providerKey);
+        $cacheKey = $this->createCacheKey($text, $voiceId, $providerName, $normalizedOptions);
 
-        if ($cached = $this->repository->getCachedSynthesis($hash)) {
+        if ($cached = $this->repository->findCachedResult($cacheKey)) {
             return $cached;
         }
 
         try {
-            $result = $prov->synthesize($textForProvider, $voiceId, $options);
+            $result = $providerInstance->synthesize($text, $voiceId, $normalizedOptions);
+
+            if (!empty($normalizedOptions['normalize'])) {
+                $result = $result->process($normalizedOptions);
+            }
+
+            $this->repository->cacheResult($cacheKey, $result, [
+                'text' => substr($text, 0, 255),
+                'voice_id' => $voiceId,
+                'provider' => $providerName,
+                'duration' => $result->duration ?? 0.0,
+                'user_id' => $normalizedOptions['user_id'] ?? null,
+            ]);
+
+            if ($this->webhookDispatcher !== null) {
+                $context = [
+                    'text' => $text,
+                    'voice_id' => $voiceId,
+                    'provider' => $providerName,
+                    'options' => $normalizedOptions,
+                ];
+                $this->webhookDispatcher->dispatchSuccess($result, $context);
+            }
+
+            return $result;
         } catch (RuntimeException $e) {
-            if ($providerKey !== 'piper' && isset($this->providers['piper'])) {
-                $result = $this->providers['piper']->synthesize($textForProvider, $voiceId, $options);
-            } else {
-                throw $e;
+            if ($providerName !== 'piper' && ($this->config['fallback']['enabled'] ?? true)) {
+                return $this->providers['piper']->synthesize($text, $voiceId, $normalizedOptions);
+            }
+            throw $e;
+        }
+    }
+
+    private function resolveProviderName(?string $provider): string
+    {
+        if ($provider === null) {
+            return strtolower($this->config['default_provider'] ?? 'elevenlabs');
+        }
+
+        return strtolower(trim($provider));
+    }
+
+    /**
+     * Normalizes provider-specific parameters (stability, similarity, style, speed).
+     * Clamps values to valid ranges, maps "similarity" to "similarity_boost" for
+     * ElevenLabs, pulls defaults from config when available, and removes
+     * unsupported keys for local providers.
+     */
+    private function normalizeOptions(string $providerName, array $options): array
+    {
+        $providerConfig = $this->config['providers'][$providerName] ?? $this->config['providers']['elevenlabs'] ?? [];
+
+        $defaults = [
+            'format' => 'mp3',
+            'normalize' => $this->config['ffmpeg']['normalize'] ?? true,
+            'target_loudness' => $this->config['ffmpeg']['target_loudness'] ?? -16.0,
+            'speed' => $providerConfig['speed'] ?? 1.0,
+            'stability' => $providerConfig['stability'] ?? 0.5,
+            'similarity' => $providerConfig['similarity'] ?? 0.75,
+            'style' => $providerConfig['style'] ?? 0.0,
+        ];
+
+        $options = array_merge($defaults, $options);
+
+        // Clamp values to safe ranges
+        $options['stability'] = max(0.0, min(1.0, (float) $options['stability']));
+        $options['similarity'] = max(0.0, min(1.0, (float) $options['similarity']));
+        $options['style'] = max(0.0, min(1.0, (float) $options['style']));
+        $options['speed'] = (float) $options['speed'];
+
+        if ($providerName === 'elevenlabs' || $providerName === 'eleven') {
+            if (!isset($options['similarity_boost'])) {
+                $options['similarity_boost'] = $options['similarity'];
+            }
+            $options['speed'] = max(0.5, min(2.0, $options['speed']));
+        } elseif ($providerName === 'openai') {
+            $options['speed'] = max(0.25, min(4.0, $options['speed']));
+        } elseif ($providerName === 'piper') {
+            // Piper does not use these parameters
+            unset(
+                $options['stability'],
+                $options['similarity'],
+                $options['style'],
+                $options['speed'],
+                $options['similarity_boost']
+            );
+        }
+
+        return $options;
+    }
+
+    private function createCacheKey(string $text, string $voiceId, string $provider, array $options): string
+    {
+        $relevant = [
+            'text' => md5($text),
+            'voice' => $voiceId,
+            'provider' => $provider,
+            'format' => $options['format'] ?? 'mp3',
+            'stability' => $options['stability'] ?? null,
+            'similarity' => $options['similarity'] ?? null,
+            'style' => $options['style'] ?? null,
+            'speed' => $options['speed'] ?? null,
+        ];
+
+        return hash('sha256', json_encode($relevant, JSON_THROW_ON_ERROR));
+    }
+
+    public function listVoices(?string $provider = null): array
+    {
+        if ($provider !== null) {
+            $name = strtolower(trim($provider));
+            if (isset($this->providers[$name])) {
+                return $this->providers[$name]->listVoices();
+            }
+            throw new InvalidArgumentException("Unknown provider: {$provider}");
+        }
+
+        $all = [];
+        foreach ($this->providers as $name => $prov) {
+            $voices = $prov->listVoices();
+            foreach ($voices as $v) {
+                $v['provider'] = $name;
+                $all[] = $v;
             }
         }
-
-        $result = $this->applyPostProcessing($result, $options);
-
-        $this->repository->saveGeneration([
-            'hash' => $hash,
-            'text' => $text,
-            'voice_id' => $voiceId,
-            'provider' => $providerKey,
-            'format' => $result->format ?? 'mp3',
-            'duration' => $result->duration ?? null,
-            'metadata' => $result->metadata,
-            'audio_size_bytes' => strlen($result->audioContent ?? ''),
-            'generated_at' => (new DateTimeImmutable())->format('Y-m-d H:i:s'),
-            'user_id' => 1,
-        ]);
-
-        if ($this->webhookDispatcher !== null) {
-            $this->webhookDispatcher->dispatchSuccess($result, [
-                'text' => $text,
-                'voice_id' => $voiceId,
-                'provider' => $providerKey,
-                'user_id' => 1,
-            ]);
-        }
-
-        return $result;
+        return $all;
     }
 
     public function cloneVoice(
         string $name,
         string $samplePath,
-        string $provider = 'elevenlabs',
-        ?int $userId = null
+        ?string $provider = null,
+        array $options = []
     ): string {
-        $providerKey = strtolower($provider);
+        $providerName = $this->resolveProviderName($provider);
 
-        if (!isset($this->providers[$providerKey])) {
-            throw new InvalidArgumentException("Provider {$providerKey} not available for cloning.");
+        if (!isset($this->providers[$providerName])) {
+            throw new InvalidArgumentException("Provider '{$providerName}' is not registered.");
         }
 
-        $prov = $this->providers[$providerKey];
-        $voiceId = $prov->cloneVoice($name, $samplePath);
-
-        $this->repository->saveCustomVoice(
-            $name,
-            $voiceId,
-            $providerKey,
-            $userId ?? 1
-        );
+        $voiceId = $this->providers[$providerName]->cloneVoice($name, $samplePath, $options);
+        $this->repository->saveCustomVoice($voiceId, $name, $providerName, $options);
 
         return $voiceId;
     }
 
-    public function listVoices(?string $provider = null): array
+    public function listProviders(): array
     {
-        $key = strtolower($provider ?? 'elevenlabs');
-
-        if (isset($this->providers[$key]) && method_exists($this->providers[$key], 'listVoices')) {
-            return $this->providers[$key]->listVoices();
-        }
-
-        return $this->repository->listLibrary();
+        return array_keys($this->providers);
     }
 
-    private function stripSSML(string $text): string
+    public function getProvider(string $name): ProviderInterface
     {
-        return preg_replace('~<[^>]*>~', '', $text) ?? $text;
-    }
-
-    private function applyPostProcessing(SynthesisResult $result, array $options): SynthesisResult
-    {
-        $normalize = $options['normalize'] ?? ($this->config['ffmpeg']['normalize'] ?? true);
-
-        if ($normalize && isset($this->config['ffmpeg']['binary'])) {
-            $result->metadata = array_merge($result->metadata ?? [], [
-                'normalized' => true,
-                'target_loudness' => $options['target_loudness'] ?? -16.0,
-            ]);
+        $name = strtolower(trim($name));
+        if (!isset($this->providers[$name])) {
+            throw new InvalidArgumentException("Provider '{$name}' not registered.");
         }
-
-        if (isset($options['format']) && $options['format'] !== ($result->format ?? 'mp3')) {
-            $result->format = $options['format'];
-        }
-
-        return $result;
-    }
-
-    private function computeHash(string $text, string $voiceId, string $provider): string
-    {
-        $normalized = mb_strtolower(trim($text)) . '::' . trim($voiceId) . '::' . $provider;
-        return hash('sha256', $normalized);
+        return $this->providers[$name];
     }
 }

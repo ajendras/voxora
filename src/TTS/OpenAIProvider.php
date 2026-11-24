@@ -6,140 +6,95 @@ namespace Voxora\TTS;
 
 use GuzzleHttp\Client;
 use GuzzleHttp\Exception\GuzzleException;
-use RuntimeException;
 use InvalidArgumentException;
+use RuntimeException;
 
 /**
  * OpenAIProvider
  *
- * Built-in provider for OpenAI TTS API (tts-1 and tts-1-hd models).
- * Supports the 6 standard voices, SSML by stripping tags (as the API is text-only),
- * and voice listing. Returns MP3 by default.
+ * Official OpenAI TTS support. Automatically strips SSML and now respects
+ * the 'speed' parameter passed through TTS\Manager::normalizeOptions().
  */
 final class OpenAIProvider implements ProviderInterface
 {
     private Client $client;
-    private string $model;
+    private array $config;
 
-    /**
-     * @param array<string, mixed> $config Must contain 'api_key'
-     */
     public function __construct(array $config = [])
     {
-        if (empty($config['api_key'])) {
+        $this->config = $config;
+        $apiKey = $config['api_key'] ?? '';
+        if (empty($apiKey)) {
             throw new InvalidArgumentException('OpenAI API key is required in config.');
         }
-
-        $this->model = $config['model'] ?? 'tts-1';
 
         $this->client = new Client([
             'base_uri' => $config['base_uri'] ?? 'https://api.openai.com/v1/',
             'headers' => [
-                'Authorization' => 'Bearer ' . $config['api_key'],
+                'Authorization' => 'Bearer ' . $apiKey,
                 'Content-Type' => 'application/json',
             ],
-            'timeout' => 30,
         ]);
     }
 
     public function synthesize(string $text, string $voiceId, array $options = []): SynthesisResult
     {
-        if (trim($text) === '') {
-            throw new InvalidArgumentException('Text cannot be empty.');
-        }
-
-        $cleanText = $this->stripSSML($text);
-
-        if (strlen($cleanText) > 4096) {
-            $cleanText = substr($cleanText, 0, 4096);
-        }
-
-        $payload = [
-            'model' => $options['model'] ?? $this->model,
-            'input' => $cleanText,
-            'voice' => $voiceId,
-        ];
-
-        if (isset($options['speed'])) {
-            $payload['speed'] = max(0.25, min(4.0, (float) $options['speed']));
-        }
-
+        $cleanText = $this->stripSsml($text);
+        $model = $options['model'] ?? $this->config['model'] ?? 'tts-1';
+        $speed = $options['speed'] ?? 1.0;
         $format = strtolower($options['format'] ?? 'mp3');
-        if (!in_array($format, ['mp3', 'wav', 'opus'], true)) {
-            $format = 'mp3';
-        }
-        $payload['response_format'] = $format;
 
         try {
+            $payload = [
+                'model' => $model,
+                'input' => $cleanText,
+                'voice' => $voiceId,
+                'speed' => $speed,
+            ];
+
+            $accept = $format === 'wav' ? 'audio/wav' : 'audio/mpeg';
+
             $response = $this->client->post('audio/speech', [
                 'json' => $payload,
+                'headers' => [
+                    'Accept' => $accept,
+                ],
             ]);
 
-            $audioContent = (string) $response->getBody();
+            $audio = (string) $response->getBody();
+            $duration = $this->estimateDuration($audio, $format);
 
-            return new SynthesisResult(
-                audioContent: $audioContent,
-                format: $format,
-                duration: null, // measured in SynthesisResult::process() or Manager
-                metadata: [
-                    'provider' => 'openai',
-                    'model' => $payload['model'],
-                    'voice' => $voiceId,
-                    'ssml_stripped' => $text !== $cleanText,
-                ]
-            );
+            return new SynthesisResult($audio, $format, $duration);
         } catch (GuzzleException $e) {
-            throw new RuntimeException('OpenAI TTS request failed: ' . $e->getMessage(), 0, $e);
+            throw new RuntimeException('OpenAI TTS failed: ' . $e->getMessage(), 0, $e);
         }
+    }
+
+    private function stripSsml(string $text): string
+    {
+        return preg_replace('/<[^>]*>/', '', $text) ?? $text;
     }
 
     public function listVoices(): array
     {
         return [
-            [
-                'id' => 'alloy',
-                'name' => 'Alloy',
-                'description' => 'OpenAI • Neutral and versatile',
-            ],
-            [
-                'id' => 'echo',
-                'name' => 'Echo',
-                'description' => 'OpenAI • Clear and articulate',
-            ],
-            [
-                'id' => 'fable',
-                'name' => 'Fable',
-                'description' => 'OpenAI • Narrative storyteller',
-            ],
-            [
-                'id' => 'onyx',
-                'name' => 'Onyx',
-                'description' => 'OpenAI • Deep and authoritative',
-            ],
-            [
-                'id' => 'nova',
-                'name' => 'Nova',
-                'description' => 'OpenAI • Energetic female',
-            ],
-            [
-                'id' => 'shimmer',
-                'name' => 'Shimmer',
-                'description' => 'OpenAI • Bright and engaging',
-            ],
+            ['id' => 'alloy', 'name' => 'Alloy', 'language' => 'en', 'gender' => 'neutral'],
+            ['id' => 'echo', 'name' => 'Echo', 'language' => 'en', 'gender' => 'male'],
+            ['id' => 'fable', 'name' => 'Fable', 'language' => 'en', 'gender' => 'male'],
+            ['id' => 'onyx', 'name' => 'Onyx', 'language' => 'en', 'gender' => 'male'],
+            ['id' => 'nova', 'name' => 'Nova', 'language' => 'en', 'gender' => 'female'],
+            ['id' => 'shimmer', 'name' => 'Shimmer', 'language' => 'en', 'gender' => 'female'],
         ];
     }
 
-    public function cloneVoice(string $name, string $samplePath, ?int $userId = null): string
+    public function cloneVoice(string $name, string $samplePath, array $options = []): string
     {
-        throw new RuntimeException('Voice cloning is not supported by the OpenAI TTS API.');
+        throw new RuntimeException('Voice cloning is not supported by OpenAIProvider. Use ElevenLabs.');
     }
 
-    private function stripSSML(string $text): string
+    private function estimateDuration(string $audioContent, string $format): float
     {
-        // Remove SSML tags but preserve the inner text content for compatibility
-        // with the rich SSML editor in the dashboard.
-        $text = preg_replace('/<\s*[^>]+>/', ' ', $text);
-
-        return trim(preg_replace('/\s+/', ' ', $text));
+        $bytesPerSecond = ($format === 'mp3') ? 16000 : 32000;
+        return strlen($audioContent) / $bytesPerSecond;
     }
 }
