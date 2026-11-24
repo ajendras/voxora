@@ -8,13 +8,16 @@ use Voxora\Storage\SqliteRepository;
 use DateTimeImmutable;
 use InvalidArgumentException;
 use RuntimeException;
+use Cron\CronExpression;
 
 /**
  * Scheduler
  *
- * Manages persistent scheduled batch jobs using cron expressions.
- * Jobs are stored in SQLite. runDue() is meant to be called frequently (e.g. * * * * * from system cron).
- * Supports basic 5-field cron expressions. Added runJob(), updateJob() and deleteJob() to support the web UI.
+ * Manages persistent scheduled batch jobs using the dragonmantank/cron-expression
+ * library for full cron specification compliance (including ranges, steps, lists,
+ * named values, and special strings like @daily). Jobs are stored in SQLite.
+ * runDue() is meant to be called frequently (e.g. * * * * * from system cron).
+ * The last-run timestamp prevents duplicate execution in the same minute.
  */
 final class Scheduler
 {
@@ -116,7 +119,6 @@ final class Scheduler
     {
         $jobs = $this->repository->listScheduledJobs();
         $results = [];
-        $now = new DateTimeImmutable();
 
         foreach ($jobs as $job) {
             if ($this->isDue($job['cron_expression'] ?? '* * * * *', $job['last_run_at'] ?? null)) {
@@ -136,14 +138,29 @@ final class Scheduler
 
     private function isDue(string $cron, ?string $lastRun): bool
     {
-        $expression = new CronExpression($cron);
-        return $expression->isDue();
+        $expression = CronExpression::factory($cron);
+        $now = new DateTimeImmutable();
+
+        if ($lastRun !== null) {
+            try {
+                $last = new DateTimeImmutable($lastRun);
+                // prevent duplicate execution in the same minute using last-run timestamp
+                if ($last->format('Y-m-d H:i') === $now->format('Y-m-d H:i')) {
+                    return false;
+                }
+            } catch (\Exception $e) {
+                // invalid last-run timestamp; fall back to normal due check
+            }
+        }
+
+        return $expression->isDue($now);
     }
 
     private function getNextRunTime(string $cron): string
     {
-        $expression = new CronExpression($cron);
-        return $expression->getNextRunDate()->format('Y-m-d H:i');
+        $expression = CronExpression::factory($cron);
+        $next = $expression->getNextRunDate(new DateTimeImmutable());
+        return $next->format('Y-m-d H:i');
     }
 
     private function determineStatus(array $job): string
@@ -163,82 +180,5 @@ final class Scheduler
             "[$timestamp] $message\n",
             FILE_APPEND
         );
-    }
-}
-
-/**
- * Lightweight CronExpression parser supporting 5 fields.
- * Very basic implementation for common cases (*, numbers, ranges).
- */
-final class CronExpression
-{
-    private array $parts;
-
-    public function __construct(string $expression)
-    {
-        $parts = preg_split('/\s+/', trim($expression));
-        if (count($parts) !== 5) {
-            throw new InvalidArgumentException('Cron expression must have 5 fields');
-        }
-        $this->parts = $parts;
-    }
-
-    public function isDue(?DateTimeImmutable $date = null): bool
-    {
-        $date = $date ?? new DateTimeImmutable();
-        $minute = (int) $date->format('i');
-        $hour = (int) $date->format('G');
-        $day = (int) $date->format('j');
-        $month = (int) $date->format('n');
-        $dow = (int) $date->format('w');
-
-        return $this->matches($this->parts[0], $minute, 0, 59)
-            && $this->matches($this->parts[1], $hour, 0, 23)
-            && $this->matches($this->parts[2], $day, 1, 31)
-            && $this->matches($this->parts[3], $month, 1, 12)
-            && $this->matches($this->parts[4], $dow, 0, 6);
-    }
-
-    public function getNextRunDate(?DateTimeImmutable $from = null): DateTimeImmutable
-    {
-        $from = $from ?? new DateTimeImmutable();
-        $next = $from->modify('+1 minute');
-
-        for ($i = 0; $i < 1440; $i++) {
-            if ($this->isDue($next)) {
-                return $next;
-            }
-            $next = $next->modify('+1 minute');
-        }
-
-        return $from->modify('+1 day');
-    }
-
-    private function matches(string $field, int $value, int $min, int $max): bool
-    {
-        if ($field === '*') {
-            return true;
-        }
-
-        if (is_numeric($field)) {
-            return (int)$field === $value;
-        }
-
-        if (str_contains($field, '*/')) {
-            $step = (int) substr($field, 2);
-            return $value % $step === 0;
-        }
-
-        if (str_contains($field, '-')) {
-            [$start, $end] = array_map('intval', explode('-', $field));
-            return $value >= $start && $value <= $end;
-        }
-
-        if (str_contains($field, ',')) {
-            $list = array_map('intval', explode(',', $field));
-            return in_array($value, $list, true);
-        }
-
-        return false;
     }
 }
