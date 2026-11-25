@@ -68,6 +68,7 @@ final class Scheduler
             $job['next_run'] = $this->getNextRunTime($job['cron_expression'] ?? '* * * * *');
             $job['status'] = $this->determineStatus($job);
         }
+        unset($job);
 
         return $jobs;
     }
@@ -138,7 +139,7 @@ final class Scheduler
 
     private function isDue(string $cron, ?string $lastRun): bool
     {
-        $expression = CronExpression::factory($cron);
+        $expression = new CronExpression($cron);
         $now = new DateTimeImmutable();
 
         if ($lastRun !== null) {
@@ -158,7 +159,7 @@ final class Scheduler
 
     private function getNextRunTime(string $cron): string
     {
-        $expression = CronExpression::factory($cron);
+        $expression = new CronExpression($cron);
         $next = $expression->getNextRunDate(new DateTimeImmutable());
         return $next->format('Y-m-d H:i');
     }
