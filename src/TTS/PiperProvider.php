@@ -10,108 +10,151 @@ use RuntimeException;
 /**
  * PiperProvider
  *
- * Offline/local TTS using the Piper CLI (via Symfony Process).
- * Always produces WAV. Duration is extracted from the RIFF/WAVE header.
- * Cloning is not supported. The processFactory allows easy mocking in tests.
+ * Local offline TTS using the Piper CLI binary (via Symfony Process).
+ * Outputs WAV; duration extracted safely from RIFF header.
+ * Mocked in unit tests for reliable CI runs across PHP versions.
+ * Does not support voice cloning (throws as documented in ProviderInterface).
  */
 final class PiperProvider implements ProviderInterface
 {
-    private string $binary;
-    private string $model;
-    private $processFactory;
+    private array $config;
 
-    public function __construct(array $config = [], ?callable $processFactory = null)
+    public function __construct(array $config = [])
     {
-        $this->binary = $config['binary'] ?? 'piper';
-        $this->model = $config['model'] ?? '';
-
-        if (empty($this->model)) {
-            throw new RuntimeException('Piper model path must be configured');
-        }
-
-        $this->processFactory = $processFactory ?? static fn (array $command): Process => new Process($command);
+        $this->config = $config + [
+            'binary' => 'piper',
+            'model' => '',
+        ];
     }
 
     public function synthesize(string $text, string $voiceId, array $options = []): SynthesisResult
     {
-        $text = trim($text);
-        if ($text === '') {
-            throw new RuntimeException('Cannot synthesize empty text');
+        $text = $this->stripSSML($text);
+        if ('' === trim($text)) {
+            throw new RuntimeException('Cannot synthesize empty text with Piper.');
         }
 
-        $command = [
-            $this->binary,
-            '--model', $this->model,
-        ];
-
-        $process = ($this->processFactory)($command);
-        $process->setInput($text);
+        $process = $this->createProcess($text);
         $process->run();
 
         if (!$process->isSuccessful()) {
-            throw new RuntimeException('Piper synthesis failed: ' . trim($process->getErrorOutput() ?: '(no output)'));
+            throw new RuntimeException('Piper synthesis failed: ' . $process->getErrorOutput());
         }
 
         $audio = $process->getOutput();
-
-        if ($audio === '' || $audio === false) {
-            throw new RuntimeException('Piper produced no audio output');
+        if ('' === $audio) {
+            throw new RuntimeException('Piper returned empty audio.');
         }
 
-        $duration = $this->extractDurationFromWav($audio);
+        $duration = $this->calculateWavDuration($audio);
 
         return new SynthesisResult($audio, 'wav', $duration);
     }
 
     public function listVoices(): array
     {
-        return [
-            [
-                'id' => 'default',
-                'name' => 'Piper Default (en_US-lessac-medium)',
-                'language' => 'en-US',
-                'gender' => 'female',
-                'description' => 'High-quality local voice (model-dependent)',
-            ],
-        ];
+        $modelName = basename($this->config['model'] ?? 'default.onnx', '.onnx');
+        $modelName = str_replace(['_', '-'], ' ', ucwords($modelName));
+
+        return [[
+            'id' => 'piper-' . strtolower($modelName),
+            'name' => trim($modelName) . ' (Piper)',
+            'language' => 'en-US',
+            'gender' => 'neutral',
+            'description' => 'High-quality offline voice',
+        ]];
     }
 
     public function cloneVoice(string $name, string $samplePath, array $options = []): string
     {
-        throw new RuntimeException('Voice cloning not supported by PiperProvider. Use a cloud provider instead.');
+        throw new RuntimeException('Voice cloning not supported by PiperProvider. Use ElevenLabs instead.');
     }
 
-    /**
-     * Parse RIFF/WAVE header to compute exact audio duration.
-     */
-    private function extractDurationFromWav(string $data): float
+    protected function createProcess(string $text): Process
     {
-        if (strlen($data) < 44 || substr($data, 0, 4) !== 'RIFF' || substr($data, 8, 4) !== 'WAVE') {
-            // Fallback for malformed output
-            return round(strlen($data) / 44100, 2);
+        $cmd = [
+            $this->config['binary'],
+            '--model',
+            $this->config['model'],
+            '--output_file',
+            '-',
+        ];
+
+        $process = new Process($cmd);
+        $process->setInput($text);
+
+        return $process;
+    }
+
+    private function stripSSML(string $text): string
+    {
+        return preg_replace('/<[^>]+>/', '', $text) ?? $text;
+    }
+
+    private function calculateWavDuration(string $data): float
+    {
+        if (strlen($data) < 44) {
+            return 0.0;
         }
 
-        $byteRate = unpack('V', substr($data, 28, 4))[1] ?? 0;
-        if ($byteRate <= 0) {
-            return 3.0;
+        if (substr($data, 0, 4) !== 'RIFF' || substr($data, 8, 4) !== 'WAVE') {
+            return 0.0;
         }
 
-        // Locate the 'data' chunk for precise size
         $pos = 12;
-        while ($pos + 8 < strlen($data)) {
-            $chunkId = substr($data, $pos, 4);
-            $chunkSize = unpack('V', substr($data, $pos + 4, 4))[1] ?? 0;
+        $sampleRate = 22050;
+        $numChannels = 1;
+        $bitsPerSample = 16;
+        $dataSize = 0;
+        $maxPos = min(strlen($data), 1024);
 
-            if ($chunkId === 'data') {
-                return round($chunkSize / $byteRate, 3);
+        while ($pos + 8 < $maxPos) {
+            $chunkId = substr($data, $pos, 4);
+            $chunkSize = $this->unpackUint32($data, $pos + 4);
+
+            if ($chunkId === 'fmt ') {
+                $numChannels = $this->unpackUint16($data, $pos + 10);
+                $sampleRate = $this->unpackUint32($data, $pos + 12);
+                $bitsPerSample = $this->unpackUint16($data, $pos + 22);
+            } elseif ($chunkId === 'data') {
+                $dataSize = $this->unpackUint32($data, $pos + 4);
+                break;
             }
 
             $pos += 8 + $chunkSize;
             if ($chunkSize % 2 === 1) {
-                $pos++; // padding
+                $pos++;
             }
         }
 
-        return round((strlen($data) - 44) / $byteRate, 3);
+        if ($dataSize === 0 || $sampleRate === 0) {
+            return strlen($data) / 32000.0;
+        }
+
+        $bytesPerSecond = $sampleRate * $numChannels * ($bitsPerSample / 8);
+
+        return $bytesPerSecond > 0 ? $dataSize / $bytesPerSecond : 0.0;
+    }
+
+    private function unpackUint32(string $data, int $offset): int
+    {
+        if (strlen($data) < $offset + 4) {
+            return 0;
+        }
+
+        $unpacked = unpack('V', substr($data, $offset, 4));
+
+        return $unpacked[1] ?? 0;
+    }
+
+    private function unpackUint16(string $data, int $offset): int
+    {
+        if (strlen($data) < $offset + 2) {
+            return 0;
+        }
+
+        $unpacked = unpack('v', substr($data, $offset, 2));
+
+        return $unpacked[1] ?? 0;
     }
 }
