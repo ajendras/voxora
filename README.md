@@ -832,9 +832,12 @@ flowchart TD
 │   └── scheduler-run.php         # Entry-point called by system cron (runDue())
 ├── tests/
 │   └── Unit/
+│       ├── ApiControllerTest.php # integration tests for all API endpoints with in-memory DB
+│       ├── BatchGeneratorTest.php # CSV parsing, progress, error handling, webhook
 │       ├── KeyManagerTest.php    # token issuance, validation, expiry, scopes, roles
 │       ├── PiperProviderTest.php # WAV RIFF duration, cloneVoice exception, listVoices
-│       └── SchedulerTest.php     # Scheduler (mocks)
+│       ├── ReportTest.php        # value object, summary, toArray
+│       └── SchedulerTest.php     # job CRUD, runDue, isDue logic with mocks + reflection
 ├── Dockerfile                    # Official container with Piper + example voice
 ├── docker-compose.yml            # Redis + PHP/Apache stack
 └── data/                         # SQLite DB and generated audio (gitignored)
@@ -850,7 +853,11 @@ vendor/bin/phpunit
 
 PHPUnit is configured via `phpunit.xml.dist` (disables the result cache to avoid "Could not write test results to cache file" errors in CI environments such as the PHP 8.2 job).
 
-The test suite covers `KeyManager` token issuance, validation, expiry checks, encryption round-trips, scope enforcement and the new role/userId fields. `PiperProviderTest` validates WAV duration extraction from the RIFF header (using a mocked Symfony Process for reliable CI runs), confirms `cloneVoice()` throws as expected, exercises the new `listVoices()` implementation, and exercises `WebhookDispatcher` with Piper results. RateLimiter behavior (allowed/blocked windows, mock Redis interactions) is covered inside `KeyManagerTest`. New tests cover the plugin registration API and resolution of custom providers. The OpenAIProvider is exercised through Manager integration tests. `SchedulerTest` exercises the full scheduler flow (including job CRUD, runDue and runJob) with mocked repository and batch generator. Cron expression parsing is covered by the comprehensive test suite of the dragonmantank/cron-expression dependency. Additional coverage was added for the new `runJob()`, `updateJob()` and `deleteJob()` methods used by the web UI.
+The test suite covers `KeyManager` token issuance, validation, expiry checks, encryption round-trips, scope enforcement and the new role/userId fields. `PiperProviderTest` validates WAV duration extraction from the RIFF header (using a mocked Symfony Process for reliable CI runs), confirms `cloneVoice()` throws as expected, exercises the new `listVoices()` implementation, and exercises `WebhookDispatcher` with Piper results. RateLimiter behavior (allowed/blocked windows, mock Redis interactions) is covered inside `KeyManagerTest`. New tests cover the plugin registration API and resolution of custom providers. The OpenAIProvider is exercised through Manager integration tests. 
+
+`ReportTest`, `BatchGeneratorTest` and `SchedulerTest` provide full unit and integration coverage for the automation layer. `ReportTest` validates the immutable value object, summary formatting and array conversion. `BatchGeneratorTest` tests CSV parsing with alternate column names, progress callback invocation, successful runs with file output and webhook dispatch, error handling for failed generations, and edge cases like missing files or empty CSVs. `SchedulerTest` uses mocks for repository and batch generator to test job CRUD, `runJob` success/failure paths with logging, `runDue` filtering, and uses reflection to unit-test the private `isDue()` logic for preventing duplicate executions within the same minute. 
+
+Cron expression parsing is covered by the comprehensive test suite of the dragonmantank/cron-expression dependency. Additional coverage was added for the new `runJob()`, `updateJob()` and `deleteJob()` methods used by the web UI.
 
 **New:** `ApiControllerTest` provides integration-style tests for every endpoint. It uses real `KeyManager` and `SqliteRepository` instances backed by an in-memory SQLite database (avoiding any need to mock final classes) together with PHPUnit mocks for `Manager`, `RateLimiter`, `WebhookDispatcher` and `Token`. This tests authentication flows, rate-limit enforcement (both token and IP), input validation errors, successful JSON responses, voice cloning (with simulated file upload), library export, history retrieval and proper error status codes (401, 400, 429). This brings the API coverage to >95% and ensures regressions are caught early. Tests were extended to cover the new pagination and filter parameters on the history endpoint.
 
@@ -880,7 +887,7 @@ The test suite covers `KeyManager` token issuance, validation, expiry checks, en
 - [x] Write dedicated guide for implementing and registering custom TTS providers
 - [x] Add provider-specific parameters (stability, similarity, style, speed) support through TTS\Manager and update ElevenLabsProvider
 - [x] Replace custom CronExpression with dragonmantank/cron-expression composer dependency for full spec compliance
-- [ ] Add unit and integration test coverage for Scheduler, BatchGenerator and Report classes
+- [x] Add unit and integration test coverage for Scheduler, BatchGenerator and Report classes
 - [ ] Expose X-RateLimit-* response headers in ApiController for client-side rate limit awareness
 - [ ] Implement voice list caching layer (Redis/SQLite) inside TTS\Manager to reduce provider API calls
 - [ ] Add API endpoints in ApiController for full CRUD on scheduled jobs (list, create, update, delete, run)
